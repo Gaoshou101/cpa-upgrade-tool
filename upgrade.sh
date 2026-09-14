@@ -73,39 +73,139 @@ detect_service_cmd() {
     fi
 }
 
+# 从 systemd 服务配置文件中提取 ExecStart 执行文件路径
+extract_execstart_from_service() {
+    local sname="$1"
+    local svc_file=""
+    
+    # 查找 user service
+    for dir in "$HOME/.config/systemd/user" "/etc/systemd/user" "/usr/lib/systemd/user"; do
+        if [ -f "$dir/$sname" ]; then
+            svc_file="$dir/$sname"
+            break
+        fi
+    done
+
+    # 查找 system service
+    if [ -z "$svc_file" ]; then
+        for dir in "/etc/systemd/system" "/lib/systemd/system" "/usr/lib/systemd/system"; do
+            if [ -f "$dir/$sname" ]; then
+                svc_file="$dir/$sname"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$svc_file" ]; then
+        local raw_exec
+        raw_exec=$(grep -E '^\s*ExecStart=' "$svc_file" 2>/dev/null | head -n 1 | sed 's/^\s*ExecStart=//' || true)
+        if [ -n "$raw_exec" ]; then
+            # 提取第一个参数作为可执行文件路径
+            local bin_path
+            bin_path=$(echo "$raw_exec" | awk '{print $1}')
+            # 移除前置负号（systemd 忽略错误标记）
+            bin_path="${bin_path#-}"
+            if [ -f "$bin_path" ]; then
+                echo "$bin_path"
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
 # ------------------------------------------------------------------------------
 # 3. 升级 CLIProxyAPI (CPA)
 # ------------------------------------------------------------------------------
 upgrade_cpa() {
     log_step "准备升级 CLIProxyAPI (CPA)"
 
-    # 自动探测 CPA 安装路径与服务名
-    local CPA_BIN=$(command -v cliproxyapi || command -v CLIProxyAPI || which cli-proxy-api 2>/dev/null || true)
-    if [ -z "$CPA_BIN" ]; then
-        for p in "$HOME/bin/cliproxyapi" "$HOME/.local/bin/cliproxyapi" "/usr/local/bin/cliproxyapi" "/opt/cliproxyapi/cliproxyapi"; do
-            if [ -f "$p" ]; then CPA_BIN="$p"; break; fi
-        done
-    fi
-
-    if [ -z "$CPA_BIN" ]; then
-        read -r -p "未自动检测到 CPA 可执行文件路径，请输入绝对路径 (例如 $HOME/bin/cliproxyapi): " CPA_BIN
-    fi
-
-    if [ ! -f "$CPA_BIN" ]; then
-        log_err "文件不存在: $CPA_BIN，跳过 CPA 升级。"
-        return 1
-    fi
-
-    local CPA_DIR=$(dirname "$CPA_BIN")
+    # 确定服务名
     local CPA_SVC_NAME="cliproxyapi.service"
     if ! systemctl --user list-unit-files 2>/dev/null | grep -q "cliproxyapi"; then
         if systemctl --user list-unit-files 2>/dev/null | grep -q "cli-proxy-api"; then
             CPA_SVC_NAME="cli-proxy-api.service"
         fi
     fi
+
+    # 自动探测 CPA 安装路径与二进制
+    local CPA_BIN=""
+
+    # 策略 1: 从正在运行的进程中直接提取
+    local PID_PATH
+    PID_PATH=$(pgrep -f "cli-proxy-api|cliproxyapi|CLIProxyAPI" 2>/dev/null | head -n 1 || true)
+    if [ -n "$PID_PATH" ]; then
+        local EXE_LINK
+        EXE_LINK=$(readlink -f "/proc/$PID_PATH/exe" 2>/dev/null || true)
+        if [ -f "$EXE_LINK" ]; then
+            CPA_BIN="$EXE_LINK"
+            log_info "通过运行进程精准探测到 CPA: $CPA_BIN"
+        fi
+    fi
+
+    # 策略 2: 从 systemd service 配置中的 ExecStart 提取
+    if [ -z "$CPA_BIN" ]; then
+        CPA_BIN=$(extract_execstart_from_service "$CPA_SVC_NAME" || extract_execstart_from_service "cliproxyapi.service" || extract_execstart_from_service "cli-proxy-api.service" || true)
+        if [ -n "$CPA_BIN" ]; then
+            log_info "通过 systemd 服务配置提取到 CPA: $CPA_BIN"
+        fi
+    fi
+
+    # 策略 3: 从 PATH 命令直接获取
+    if [ -z "$CPA_BIN" ]; then
+        CPA_BIN=$(command -v cliproxyapi || command -v CLIProxyAPI || which cli-proxy-api 2>/dev/null || true)
+    fi
+
+    # 策略 4: 扫描官方常见安装路径与安装脚本默认路径 (~/cliproxyapi)
+    if [ -z "$CPA_BIN" ]; then
+        local search_paths=(
+            # 官方 Linux 一键安装脚本默认路径
+            "$HOME/cliproxyapi/cli-proxy-api"
+            "$HOME/cliproxyapi/CLIProxyAPI"
+            "$HOME/cliproxyapi/cliproxyapi"
+            # 常见 bin 目录
+            "$HOME/bin/cliproxyapi"
+            "$HOME/bin/cli-proxy-api"
+            "$HOME/.local/bin/cliproxyapi"
+            "$HOME/.local/bin/cli-proxy-api"
+            "/usr/local/bin/cliproxyapi"
+            "/usr/local/bin/cli-proxy-api"
+            "/opt/cliproxyapi/cliproxyapi"
+            "/opt/cliproxyapi/cli-proxy-api"
+        )
+        for p in "${search_paths[@]}"; do
+            if [ -f "$p" ]; then CPA_BIN="$p"; break; fi
+        done
+    fi
+
+    # 策略 5: 若用户输入目录或未找到，提示输入，支持输入目录自动识别
+    if [ -z "$CPA_BIN" ]; then
+        read -r -p "未自动检测到 CPA 可执行文件路径，请输入路径 (可输入目录如 $HOME/cliproxyapi): " INPUT_PATH
+        INPUT_PATH="${INPUT_PATH/#\~/$HOME}" # 展开波浪号
+        if [ -d "$INPUT_PATH" ]; then
+            # 如果输入的是目录，自动寻找其下的二进制
+            for candidate in "cli-proxy-api" "CLIProxyAPI" "cliproxyapi"; do
+                if [ -f "$INPUT_PATH/$candidate" ]; then
+                    CPA_BIN="$INPUT_PATH/$candidate"
+                    break
+                fi
+            done
+        elif [ -f "$INPUT_PATH" ]; then
+            CPA_BIN="$INPUT_PATH"
+        fi
+    fi
+
+    if [ -z "$CPA_BIN" ] || [ ! -f "$CPA_BIN" ]; then
+        log_err "未能定位到 CPA 可执行文件，跳过 CPA 升级。"
+        return 1
+    fi
+
+    local CPA_DIR=$(dirname "$CPA_BIN")
+    local BIN_FILENAME=$(basename "$CPA_BIN")
     local CTL=$(detect_service_cmd "$CPA_SVC_NAME")
 
-    log_info "CPA 目标路径: $CPA_BIN"
+    log_info "CPA 目标文件: $CPA_BIN"
+    log_info "CPA 所在目录: $CPA_DIR"
     log_info "服务管理器: $CTL $CPA_SVC_NAME"
 
     # 获取最新版本 tag
@@ -134,7 +234,7 @@ upgrade_cpa() {
 
     log_info "解压新版本..."
     tar -xzf "$TMP_DIR/$PKG_NAME" -C "$TMP_DIR"
-    local NEW_BIN=$(find "$TMP_DIR" -type f \( -name "CLIProxyAPI" -o -name "cliproxyapi" \) | head -n 1)
+    local NEW_BIN=$(find "$TMP_DIR" -type f \( -name "CLIProxyAPI" -o -name "cli-proxy-api" \) | head -n 1)
     if [ -z "$NEW_BIN" ]; then
         log_err "解压包中未找到二进制文件！"
         rm -rf "$TMP_DIR"
@@ -150,8 +250,8 @@ upgrade_cpa() {
     log_info "备份旧二进制 -> $BACKUP_BIN"
     cp -a "$CPA_BIN" "$BACKUP_BIN"
 
-    # 替换
-    log_info "应用新版本二进制..."
+    # 替换 (保持原文件名一致，如原名为 cli-proxy-api 则继续沿用)
+    log_info "应用新版本二进制 -> $CPA_BIN"
     cp -f "$NEW_BIN" "$CPA_BIN"
 
     # 重启并检查状态
@@ -177,28 +277,71 @@ upgrade_cpa() {
 upgrade_cpamp() {
     log_step "准备升级 CPA Manager Plus (CPAMP)"
 
-    # 自动检测 CPAMP 安装路径
-    local CPAMP_BIN=$(command -v cpa-manager-plus || which cpa-manager-plus 2>/dev/null || true)
+    local CPAMP_SVC_NAME="cpa-manager-plus.service"
+    local CPAMP_BIN=""
+
+    # 策略 1: 从正在运行的进程中直接提取
+    local PID_PATH
+    PID_PATH=$(pgrep -f "cpa-manager-plus" 2>/dev/null | head -n 1 || true)
+    if [ -n "$PID_PATH" ]; then
+        local EXE_LINK
+        EXE_LINK=$(readlink -f "/proc/$PID_PATH/exe" 2>/dev/null || true)
+        if [ -f "$EXE_LINK" ]; then
+            CPAMP_BIN="$EXE_LINK"
+            log_info "通过运行进程精准探测到 CPAMP: $CPAMP_BIN"
+        fi
+    fi
+
+    # 策略 2: 从 systemd service 配置中的 ExecStart 提取
     if [ -z "$CPAMP_BIN" ]; then
-        for p in "/opt/cpa-manager-plus/cpa-manager-plus" "$HOME/cpa-manager-plus/cpa-manager-plus" "$HOME/bin/cpa-manager-plus"; do
+        CPAMP_BIN=$(extract_execstart_from_service "$CPAMP_SVC_NAME" || true)
+        if [ -n "$CPAMP_BIN" ]; then
+            log_info "通过 systemd 服务配置提取到 CPAMP: $CPAMP_BIN"
+        fi
+    fi
+
+    # 策略 3: 从 PATH 命令直接获取
+    if [ -z "$CPAMP_BIN" ]; then
+        CPAMP_BIN=$(command -v cpa-manager-plus || which cpa-manager-plus 2>/dev/null || true)
+    fi
+
+    # 策略 4: 扫描官方常见安装路径
+    if [ -z "$CPAMP_BIN" ]; then
+        local search_paths=(
+            "/opt/cpa-manager-plus/cpa-manager-plus"
+            "$HOME/cpa-manager-plus/cpa-manager-plus"
+            "$HOME/cpa-manager/cpa-manager-plus"
+            "$HOME/bin/cpa-manager-plus"
+            "$HOME/.local/bin/cpa-manager-plus"
+            "/usr/local/bin/cpa-manager-plus"
+        )
+        for p in "${search_paths[@]}"; do
             if [ -f "$p" ]; then CPAMP_BIN="$p"; break; fi
         done
     fi
 
+    # 策略 5: 若用户输入目录或未找到，支持输入目录自动识别
     if [ -z "$CPAMP_BIN" ]; then
-        read -r -p "未自动检测到 CPAMP 可执行文件路径，请输入绝对路径 (例如 /opt/cpa-manager-plus/cpa-manager-plus): " CPAMP_BIN
+        read -r -p "未自动检测到 CPAMP 可执行文件路径，请输入路径 (可输入目录如 /opt/cpa-manager-plus): " INPUT_PATH
+        INPUT_PATH="${INPUT_PATH/#\~/$HOME}"
+        if [ -d "$INPUT_PATH" ]; then
+            if [ -f "$INPUT_PATH/cpa-manager-plus" ]; then
+                CPAMP_BIN="$INPUT_PATH/cpa-manager-plus"
+            fi
+        elif [ -f "$INPUT_PATH" ]; then
+            CPAMP_BIN="$INPUT_PATH"
+        fi
     fi
 
-    if [ ! -f "$CPAMP_BIN" ]; then
-        log_err "文件不存在: $CPAMP_BIN，跳过 CPAMP 升级。"
+    if [ -z "$CPAMP_BIN" ] || [ ! -f "$CPAMP_BIN" ]; then
+        log_err "未能定位到 CPAMP 可执行文件，跳过 CPAMP 升级。"
         return 1
     fi
 
     local CPAMP_DIR=$(dirname "$CPAMP_BIN")
-    local CPAMP_SVC_NAME="cpa-manager-plus.service"
     local CTL=$(detect_service_cmd "$CPAMP_SVC_NAME")
 
-    log_info "CPAMP 目标路径: $CPAMP_BIN"
+    log_info "CPAMP 目标文件: $CPAMP_BIN"
     log_info "CPAMP 所在目录: $CPAMP_DIR"
     log_info "服务管理器: $CTL $CPAMP_SVC_NAME"
 
