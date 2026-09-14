@@ -2,7 +2,7 @@
 # ==============================================================================
 # CLIProxyAPI (CPA) & CPA Manager Plus (CPAMP) 远端 VPS 一键升级脚本
 # 支持架构：x86_64 (amd64) / aarch64 (arm64)
-# 支持服务管理：systemctl --user / sudo systemctl / 自动探测
+# 支持服务管理：systemctl --user / sudo systemctl / run.sh nohup 进程管理
 # ==============================================================================
 
 set -euo pipefail
@@ -60,16 +60,16 @@ if ! curl -sI -m 3 https://api.github.com >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------------------------
-# 2. 服务控制检测 (优先 user unit，其次 system unit)
+# 2. 服务控制检测与进程启停抽象
 # ------------------------------------------------------------------------------
 detect_service_cmd() {
     local sname="$1"
-    if systemctl --user is-enabled "$sname" &>/dev/null || systemctl --user is-active "$sname" &>/dev/null; then
+    if systemctl --user list-unit-files 2>/dev/null | grep -q "$sname" || systemctl --user is-active "$sname" &>/dev/null; then
         echo "systemctl --user"
-    elif systemctl is-enabled "$sname" &>/dev/null || systemctl is-active "$sname" &>/dev/null; then
+    elif systemctl list-unit-files 2>/dev/null | grep -q "$sname" || systemctl is-active "$sname" &>/dev/null; then
         echo "sudo systemctl"
     else
-        echo "systemctl --user"
+        echo "none"
     fi
 }
 
@@ -100,11 +100,11 @@ extract_execstart_from_service() {
         local raw_exec
         raw_exec=$(grep -E '^\s*ExecStart=' "$svc_file" 2>/dev/null | head -n 1 | sed 's/^\s*ExecStart=//' || true)
         if [ -n "$raw_exec" ]; then
-            # 提取第一个参数作为可执行文件路径
             local bin_path
             bin_path=$(echo "$raw_exec" | awk '{print $1}')
-            # 移除前置负号（systemd 忽略错误标记）
             bin_path="${bin_path#-}"
+            bin_path="${bin_path%\"}"
+            bin_path="${bin_path#\"}"
             if [ -f "$bin_path" ]; then
                 echo "$bin_path"
                 return 0
@@ -159,11 +159,9 @@ upgrade_cpa() {
     # 策略 4: 扫描官方常见安装路径与安装脚本默认路径 (~/cliproxyapi)
     if [ -z "$CPA_BIN" ]; then
         local search_paths=(
-            # 官方 Linux 一键安装脚本默认路径
             "$HOME/cliproxyapi/cli-proxy-api"
             "$HOME/cliproxyapi/CLIProxyAPI"
             "$HOME/cliproxyapi/cliproxyapi"
-            # 常见 bin 目录
             "$HOME/bin/cliproxyapi"
             "$HOME/bin/cli-proxy-api"
             "$HOME/.local/bin/cliproxyapi"
@@ -178,12 +176,11 @@ upgrade_cpa() {
         done
     fi
 
-    # 策略 5: 若用户输入目录或未找到，提示输入，支持输入目录自动识别
+    # 策略 5: 若用户输入目录或未找到，支持输入目录自动识别
     if [ -z "$CPA_BIN" ]; then
         read -r -p "未自动检测到 CPA 可执行文件路径，请输入路径 (可输入目录如 $HOME/cliproxyapi): " INPUT_PATH
-        INPUT_PATH="${INPUT_PATH/#\~/$HOME}" # 展开波浪号
+        INPUT_PATH="${INPUT_PATH/#\~/$HOME}"
         if [ -d "$INPUT_PATH" ]; then
-            # 如果输入的是目录，自动寻找其下的二进制
             for candidate in "cli-proxy-api" "CLIProxyAPI" "cliproxyapi"; do
                 if [ -f "$INPUT_PATH/$candidate" ]; then
                     CPA_BIN="$INPUT_PATH/$candidate"
@@ -201,7 +198,6 @@ upgrade_cpa() {
     fi
 
     local CPA_DIR=$(dirname "$CPA_BIN")
-    local BIN_FILENAME=$(basename "$CPA_BIN")
     local CTL=$(detect_service_cmd "$CPA_SVC_NAME")
 
     log_info "CPA 目标文件: $CPA_BIN"
@@ -219,11 +215,9 @@ upgrade_cpa() {
     local CLEAN_VER="${TAG#v}"
     log_info "CPA 最新版本: $TAG"
 
-    # 构造包名
     local PKG_NAME="CLIProxyAPI_${CLEAN_VER}_linux_${CPA_ARCH}.tar.gz"
     local DOWNLOAD_URL="https://github.com/router-for-me/CLIProxyAPI/releases/download/${TAG}/${PKG_NAME}"
 
-    # 下载到临时目录
     local TMP_DIR=$(mktemp -d)
     log_info "正在下载: $PKG_NAME ..."
     if ! curl -fSL --progress-bar "${GH_PROXY}${DOWNLOAD_URL}" -o "$TMP_DIR/$PKG_NAME"; then
@@ -244,28 +238,37 @@ upgrade_cpa() {
 
     # 停止服务并备份旧版本
     local BACKUP_BIN="${CPA_BIN}.bak.$(date +%Y%m%d_%H%M%S)"
-    log_info "停止服务: $CTL stop $CPA_SVC_NAME"
-    $CTL stop "$CPA_SVC_NAME" || true
+    if [ "$CTL" != "none" ]; then
+        log_info "停止服务: $CTL stop $CPA_SVC_NAME"
+        $CTL stop "$CPA_SVC_NAME" || true
+    else
+        pkill -f "$(basename "$CPA_BIN")" || true
+    fi
 
     log_info "备份旧二进制 -> $BACKUP_BIN"
     cp -a "$CPA_BIN" "$BACKUP_BIN"
 
-    # 替换 (保持原文件名一致，如原名为 cli-proxy-api 则继续沿用)
+    # 替换 (保持原文件名一致)
     log_info "应用新版本二进制 -> $CPA_BIN"
     cp -f "$NEW_BIN" "$CPA_BIN"
 
     # 重启并检查状态
-    log_info "拉起服务: $CTL start $CPA_SVC_NAME"
-    $CTL start "$CPA_SVC_NAME"
-    sleep 2
-
-    if $CTL is-active "$CPA_SVC_NAME" &>/dev/null; then
-        log_info "✅ CPA 升级成功并已正常运行！"
-    else
-        log_err "❌ CPA 服务启动异常！正在自动回滚..."
-        cp -f "$BACKUP_BIN" "$CPA_BIN"
+    if [ "$CTL" != "none" ]; then
+        log_info "拉起服务: $CTL start $CPA_SVC_NAME"
         $CTL start "$CPA_SVC_NAME"
-        log_warn "已回滚至旧版本。"
+        sleep 2
+        if $CTL is-active "$CPA_SVC_NAME" &>/dev/null; then
+            log_info "✅ CPA 升级成功并已正常运行！"
+        else
+            log_err "❌ CPA 服务启动异常！正在自动回滚..."
+            cp -f "$BACKUP_BIN" "$CPA_BIN"
+            $CTL start "$CPA_SVC_NAME"
+            log_warn "已回滚至旧版本。"
+        fi
+    else
+        nohup "$CPA_BIN" >/dev/null 2>&1 &
+        sleep 2
+        log_info "✅ CPA 二进制已更新并重新启动！"
     fi
 
     rm -rf "$TMP_DIR"
@@ -279,6 +282,7 @@ upgrade_cpamp() {
 
     local CPAMP_SVC_NAME="cpa-manager-plus.service"
     local CPAMP_BIN=""
+    local CPAMP_BASE_DIR=""
 
     # 策略 1: 从正在运行的进程中直接提取
     local PID_PATH
@@ -305,29 +309,40 @@ upgrade_cpamp() {
         CPAMP_BIN=$(command -v cpa-manager-plus || which cpa-manager-plus 2>/dev/null || true)
     fi
 
-    # 策略 4: 扫描官方常见安装路径
+    # 策略 4: 扫描官方常见安装路径 (包括 install-cpamp.sh 默认的 ~/cpa-manager-plus)
     if [ -z "$CPAMP_BIN" ]; then
         local search_paths=(
-            "/opt/cpa-manager-plus/cpa-manager-plus"
+            "$HOME/cpa-manager-plus/run.sh"
             "$HOME/cpa-manager-plus/cpa-manager-plus"
+            "/opt/cpa-manager-plus/run.sh"
+            "/opt/cpa-manager-plus/cpa-manager-plus"
+            "$HOME/cpa-manager/run.sh"
             "$HOME/cpa-manager/cpa-manager-plus"
             "$HOME/bin/cpa-manager-plus"
             "$HOME/.local/bin/cpa-manager-plus"
             "/usr/local/bin/cpa-manager-plus"
         )
         for p in "${search_paths[@]}"; do
-            if [ -f "$p" ]; then CPAMP_BIN="$p"; break; fi
+            if [ -f "$p" ]; then
+                if [[ "$p" == *"/run.sh" ]]; then
+                    CPAMP_BASE_DIR=$(dirname "$p")
+                    # 从 runtime 找最新二进制或自身
+                    CPAMP_BIN=$(find "$CPAMP_BASE_DIR" -type f -name "cpa-manager-plus" 2>/dev/null | head -n 1 || true)
+                else
+                    CPAMP_BIN="$p"
+                fi
+                break
+            fi
         done
     fi
 
-    # 策略 5: 若用户输入目录或未找到，支持输入目录自动识别
+    # 策略 5: 提示用户输入，支持输入安装根目录 (如 ~/cpa-manager-plus)
     if [ -z "$CPAMP_BIN" ]; then
-        read -r -p "未自动检测到 CPAMP 可执行文件路径，请输入路径 (可输入目录如 /opt/cpa-manager-plus): " INPUT_PATH
+        read -r -p "未自动检测到 CPAMP 路径，请输入文件或目录 (例如 $HOME/cpa-manager-plus): " INPUT_PATH
         INPUT_PATH="${INPUT_PATH/#\~/$HOME}"
         if [ -d "$INPUT_PATH" ]; then
-            if [ -f "$INPUT_PATH/cpa-manager-plus" ]; then
-                CPAMP_BIN="$INPUT_PATH/cpa-manager-plus"
-            fi
+            CPAMP_BASE_DIR="$INPUT_PATH"
+            CPAMP_BIN=$(find "$INPUT_PATH" -type f -name "cpa-manager-plus" 2>/dev/null | head -n 1 || true)
         elif [ -f "$INPUT_PATH" ]; then
             CPAMP_BIN="$INPUT_PATH"
         fi
@@ -339,11 +354,34 @@ upgrade_cpamp() {
     fi
 
     local CPAMP_DIR=$(dirname "$CPAMP_BIN")
+    # 如果处于 runtime/cpa-manager-plus_... 结构中，根目录为其上两级
+    if [ -z "$CPAMP_BASE_DIR" ]; then
+        if [ -f "$CPAMP_DIR/../../run.sh" ]; then
+            CPAMP_BASE_DIR=$(readlink -f "$CPAMP_DIR/../..")
+        elif [ -f "$CPAMP_DIR/run.sh" ]; then
+            CPAMP_BASE_DIR="$CPAMP_DIR"
+        else
+            CPAMP_BASE_DIR="$CPAMP_DIR"
+        fi
+    fi
+
+    # 探测服务控制模式：systemd 还是 run.sh (nohup/pid)
     local CTL=$(detect_service_cmd "$CPAMP_SVC_NAME")
+    local USE_RUN_SH=0
+    if [ "$CTL" = "none" ]; then
+        if [ -f "$CPAMP_BASE_DIR/run.sh" ]; then
+            USE_RUN_SH=1
+            log_info "未注册 systemd 服务，检测到官方启动脚本: $CPAMP_BASE_DIR/run.sh"
+        else
+            log_warn "未检测到 systemd 服务也未找到 run.sh，将直接管理进程。"
+        fi
+    else
+        log_info "检测到 systemd 服务管理方式: $CTL $CPAMP_SVC_NAME"
+    fi
 
     log_info "CPAMP 目标文件: $CPAMP_BIN"
     log_info "CPAMP 所在目录: $CPAMP_DIR"
-    log_info "服务管理器: $CTL $CPAMP_SVC_NAME"
+    log_info "CPAMP 项目根目录: $CPAMP_BASE_DIR"
 
     # 获取最新版本 tag
     log_info "正在获取 CPAMP 最新 Release 版本..."
@@ -377,48 +415,83 @@ upgrade_cpamp() {
     chmod +x "$NEW_BIN"
 
     # 备份关键数据（数据库 + data.key + 配置文件）
-    local BACKUP_DIR="${CPAMP_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
+    local BACKUP_DIR="${CPAMP_BASE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$BACKUP_DIR"
     log_info "正在冷备份 CPAMP 数据到 $BACKUP_DIR ..."
-    
-    # 停止服务
-    log_info "停止服务: $CTL stop $CPAMP_SVC_NAME"
-    $CTL stop "$CPAMP_SVC_NAME" || true
 
-    # 备份当前文件
+    # 停止旧服务/进程
+    if [ "$CTL" != "none" ]; then
+        log_info "停止服务: $CTL stop $CPAMP_SVC_NAME"
+        $CTL stop "$CPAMP_SVC_NAME" || true
+    elif [ "$USE_RUN_SH" -eq 1 ] && [ -f "$CPAMP_BASE_DIR/cpa-manager-plus.pid" ]; then
+        local OLD_PID=$(cat "$CPAMP_BASE_DIR/cpa-manager-plus.pid" 2>/dev/null || true)
+        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+            log_info "停止原有 CPAMP 进程 (PID: $OLD_PID)..."
+            kill "$OLD_PID" || true
+            sleep 1
+        fi
+    else
+        pkill -f "cpa-manager-plus" || true
+    fi
+
+    # 备份当前文件与目录
     cp -a "$CPAMP_BIN" "$BACKUP_DIR/"
-    if [ -d "$CPAMP_DIR/data" ]; then
-        cp -a "$CPAMP_DIR/data" "$BACKUP_DIR/"
-    fi
-    if [ -f "$CPAMP_DIR/config.json" ]; then
-        cp -a "$CPAMP_DIR/config.json" "$BACKUP_DIR/"
-    fi
-    if [ -d "/var/lib/cpa-manager-plus" ]; then
-        cp -a "/var/lib/cpa-manager-plus" "$BACKUP_DIR/" 2>/dev/null || true
-    fi
+    for d in "data" "secrets" "config.json"; do
+        if [ -e "$CPAMP_BASE_DIR/$d" ]; then
+            cp -a "$CPAMP_BASE_DIR/$d" "$BACKUP_DIR/"
+        fi
+        if [ -e "$CPAMP_DIR/$d" ] && [ "$CPAMP_DIR" != "$CPAMP_BASE_DIR" ]; then
+            cp -a "$CPAMP_DIR/$d" "$BACKUP_DIR/"
+        fi
+    done
 
-    # 替换二进制及配套静态资源 (保留原 config.json 和 data 目录不被覆盖)
+    # 替换二进制及配套静态资源
     log_info "应用新版本文件..."
     local EXTRACTED_TOP=$(dirname "$NEW_BIN")
-    if command -v rsync &>/dev/null; then
-        rsync -av --exclude="config.json" --exclude="data" --exclude="*.sqlite*" "$EXTRACTED_TOP/" "$CPAMP_DIR/" 2>/dev/null || cp -f "$NEW_BIN" "$CPAMP_BIN"
+    if [ "$CPAMP_DIR" = "$CPAMP_BASE_DIR" ]; then
+        if command -v rsync &>/dev/null; then
+            rsync -av --exclude="config.json" --exclude="data" --exclude="secrets" --exclude="*.sqlite*" "$EXTRACTED_TOP/" "$CPAMP_DIR/" 2>/dev/null || cp -f "$NEW_BIN" "$CPAMP_BIN"
+        else
+            cp -f "$NEW_BIN" "$CPAMP_BIN"
+        fi
     else
+        # 官方 runtime/package 目录结构，直接原地替换当前目标二进制
         cp -f "$NEW_BIN" "$CPAMP_BIN"
+        if [ -d "$EXTRACTED_TOP/dist" ]; then
+            cp -rf "$EXTRACTED_TOP/dist" "$CPAMP_DIR/" 2>/dev/null || true
+        fi
     fi
 
     # 重启并检查状态
-    log_info "拉起服务: $CTL start $CPAMP_SVC_NAME"
-    $CTL start "$CPAMP_SVC_NAME"
+    log_info "重新启动 CPAMP..."
+    if [ "$CTL" != "none" ]; then
+        $CTL start "$CPAMP_SVC_NAME"
+    elif [ "$USE_RUN_SH" -eq 1 ]; then
+        local LOG_FILE="$CPAMP_BASE_DIR/cpa-manager-plus.log"
+        local PID_FILE="$CPAMP_BASE_DIR/cpa-manager-plus.pid"
+        nohup "$CPAMP_BASE_DIR/run.sh" >> "$LOG_FILE" 2>&1 &
+        local NEW_PID=$!
+        echo "$NEW_PID" > "$PID_FILE"
+        log_info "已通过 run.sh 启动 (PID: $NEW_PID, 日志: $LOG_FILE)"
+    else
+        nohup "$CPAMP_BIN" >/dev/null 2>&1 &
+    fi
+
     sleep 3
 
-    if $CTL is-active "$CPAMP_SVC_NAME" &>/dev/null; then
-        local HEALTH=$(curl -s -m 3 http://127.0.0.1:18317/health 2>/dev/null || true)
-        log_info "健康检查响应: ${HEALTH:-已连通}"
+    # 健康检查
+    local HEALTH=$(curl -s -m 3 http://127.0.0.1:18317/health 2>/dev/null || true)
+    if [ -n "$HEALTH" ] || pgrep -f "cpa-manager-plus" &>/dev/null; then
+        log_info "健康检查响应: ${HEALTH:-已正常运行}"
         log_info "✅ CPAMP 升级成功并已正常运行！"
     else
         log_err "❌ CPAMP 服务启动失败！正在自动回滚..."
         cp -f "$BACKUP_DIR/cpa-manager-plus" "$CPAMP_BIN"
-        $CTL start "$CPAMP_SVC_NAME"
+        if [ "$CTL" != "none" ]; then
+            $CTL start "$CPAMP_SVC_NAME"
+        elif [ "$USE_RUN_SH" -eq 1 ]; then
+            nohup "$CPAMP_BASE_DIR/run.sh" >> "$CPAMP_BASE_DIR/cpa-manager-plus.log" 2>&1 &
+        fi
         log_warn "已回滚至备份版本。"
     fi
 
