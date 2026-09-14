@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# CLIProxyAPI (CPA) & CPA Manager Plus (CPAMP) 远端 VPS 一键升级脚本
+# CLIProxyAPI (CPA) & CPA Manager Plus (CPAMP) 远端 VPS 一键升级维护工具
 # 支持架构：x86_64 (amd64) / aarch64 (arm64)
 # 支持服务管理：systemctl --user / sudo systemctl / run.sh nohup 进程管理
+# 支持备份模式：备份后升级 / 无备份极简升级 (适合小硬盘 VPS)
 # ==============================================================================
 
 set -euo pipefail
@@ -116,9 +117,16 @@ extract_execstart_from_service() {
 
 # ------------------------------------------------------------------------------
 # 3. 升级 CLIProxyAPI (CPA)
+# 参数 $1: DO_BACKUP ("1" = 备份, "0" = 不备份)
 # ------------------------------------------------------------------------------
 upgrade_cpa() {
+    local DO_BACKUP="${1:-1}"
     log_step "准备升级 CLIProxyAPI (CPA)"
+    if [ "$DO_BACKUP" = "1" ]; then
+        log_info "当前备份模式: [已启用] 升级前备份旧二进制"
+    else
+        log_warn "当前备份模式: [已禁用] 无备份直接覆盖升级 (节省硬盘空间)"
+    fi
 
     # 确定服务名
     local CPA_SVC_NAME="cliproxyapi.service"
@@ -236,8 +244,7 @@ upgrade_cpa() {
     fi
     chmod +x "$NEW_BIN"
 
-    # 停止服务并备份旧版本
-    local BACKUP_BIN="${CPA_BIN}.bak.$(date +%Y%m%d_%H%M%S)"
+    # 停止服务
     if [ "$CTL" != "none" ]; then
         log_info "停止服务: $CTL stop $CPA_SVC_NAME"
         $CTL stop "$CPA_SVC_NAME" || true
@@ -245,8 +252,14 @@ upgrade_cpa() {
         pkill -f "$(basename "$CPA_BIN")" || true
     fi
 
-    log_info "备份旧二进制 -> $BACKUP_BIN"
-    cp -a "$CPA_BIN" "$BACKUP_BIN"
+    # 备份旧版本（按需）
+    local BACKUP_BIN="${CPA_BIN}.bak.$(date +%Y%m%d_%H%M%S)"
+    if [ "$DO_BACKUP" = "1" ]; then
+        log_info "备份旧二进制 -> $BACKUP_BIN"
+        cp -a "$CPA_BIN" "$BACKUP_BIN"
+    else
+        log_info "跳过备份旧二进制..."
+    fi
 
     # 替换 (保持原文件名一致)
     log_info "应用新版本二进制 -> $CPA_BIN"
@@ -260,10 +273,13 @@ upgrade_cpa() {
         if $CTL is-active "$CPA_SVC_NAME" &>/dev/null; then
             log_info "✅ CPA 升级成功并已正常运行！"
         else
-            log_err "❌ CPA 服务启动异常！正在自动回滚..."
-            cp -f "$BACKUP_BIN" "$CPA_BIN"
-            $CTL start "$CPA_SVC_NAME"
-            log_warn "已回滚至旧版本。"
+            log_err "❌ CPA 服务启动异常！"
+            if [ "$DO_BACKUP" = "1" ] && [ -f "$BACKUP_BIN" ]; then
+                log_warn "正在自动回滚至旧版本..."
+                cp -f "$BACKUP_BIN" "$CPA_BIN"
+                $CTL start "$CPA_SVC_NAME"
+                log_warn "已回滚至旧版本。"
+            fi
         fi
     else
         nohup "$CPA_BIN" >/dev/null 2>&1 &
@@ -276,9 +292,16 @@ upgrade_cpa() {
 
 # ------------------------------------------------------------------------------
 # 4. 升级 CPA Manager Plus (CPAMP)
+# 参数 $1: DO_BACKUP ("1" = 备份, "0" = 不备份)
 # ------------------------------------------------------------------------------
 upgrade_cpamp() {
+    local DO_BACKUP="${1:-1}"
     log_step "准备升级 CPA Manager Plus (CPAMP)"
+    if [ "$DO_BACKUP" = "1" ]; then
+        log_info "当前备份模式: [已启用] 升级前快照备份 (SQLite/密钥/配置)"
+    else
+        log_warn "当前备份模式: [已禁用] 无备份直接升级 (节省硬盘空间)"
+    fi
 
     local CPAMP_SVC_NAME="cpa-manager-plus.service"
     local CPAMP_BIN=""
@@ -326,7 +349,6 @@ upgrade_cpamp() {
             if [ -f "$p" ]; then
                 if [[ "$p" == *"/run.sh" ]]; then
                     CPAMP_BASE_DIR=$(dirname "$p")
-                    # 从 runtime 找最新二进制或自身
                     CPAMP_BIN=$(find "$CPAMP_BASE_DIR" -type f -name "cpa-manager-plus" 2>/dev/null | head -n 1 || true)
                 else
                     CPAMP_BIN="$p"
@@ -414,11 +436,6 @@ upgrade_cpamp() {
     fi
     chmod +x "$NEW_BIN"
 
-    # 备份关键数据（数据库 + data.key + 配置文件）
-    local BACKUP_DIR="${CPAMP_BASE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
-    mkdir -p "$BACKUP_DIR"
-    log_info "正在冷备份 CPAMP 数据到 $BACKUP_DIR ..."
-
     # 停止旧服务/进程
     if [ "$CTL" != "none" ]; then
         log_info "停止服务: $CTL stop $CPAMP_SVC_NAME"
@@ -434,16 +451,23 @@ upgrade_cpamp() {
         pkill -f "cpa-manager-plus" || true
     fi
 
-    # 备份当前文件与目录
-    cp -a "$CPAMP_BIN" "$BACKUP_DIR/"
-    for d in "data" "secrets" "config.json"; do
-        if [ -e "$CPAMP_BASE_DIR/$d" ]; then
-            cp -a "$CPAMP_BASE_DIR/$d" "$BACKUP_DIR/"
-        fi
-        if [ -e "$CPAMP_DIR/$d" ] && [ "$CPAMP_DIR" != "$CPAMP_BASE_DIR" ]; then
-            cp -a "$CPAMP_DIR/$d" "$BACKUP_DIR/"
-        fi
-    done
+    # 备份关键数据（按需）
+    local BACKUP_DIR="${CPAMP_BASE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
+    if [ "$DO_BACKUP" = "1" ]; then
+        mkdir -p "$BACKUP_DIR"
+        log_info "正在冷备份 CPAMP 数据到 $BACKUP_DIR ..."
+        cp -a "$CPAMP_BIN" "$BACKUP_DIR/"
+        for d in "data" "secrets" "config.json"; do
+            if [ -e "$CPAMP_BASE_DIR/$d" ]; then
+                cp -a "$CPAMP_BASE_DIR/$d" "$BACKUP_DIR/"
+            fi
+            if [ -e "$CPAMP_DIR/$d" ] && [ "$CPAMP_DIR" != "$CPAMP_BASE_DIR" ]; then
+                cp -a "$CPAMP_DIR/$d" "$BACKUP_DIR/"
+            fi
+        done
+    else
+        log_info "跳过冷备份数据以节省硬盘空间..."
+    fi
 
     # 替换二进制及配套静态资源
     log_info "应用新版本文件..."
@@ -455,7 +479,6 @@ upgrade_cpamp() {
             cp -f "$NEW_BIN" "$CPAMP_BIN"
         fi
     else
-        # 官方 runtime/package 目录结构，直接原地替换当前目标二进制
         cp -f "$NEW_BIN" "$CPAMP_BIN"
         if [ -d "$EXTRACTED_TOP/dist" ]; then
             cp -rf "$EXTRACTED_TOP/dist" "$CPAMP_DIR/" 2>/dev/null || true
@@ -485,22 +508,39 @@ upgrade_cpamp() {
         log_info "健康检查响应: ${HEALTH:-已正常运行}"
         log_info "✅ CPAMP 升级成功并已正常运行！"
     else
-        log_err "❌ CPAMP 服务启动失败！正在自动回滚..."
-        cp -f "$BACKUP_DIR/cpa-manager-plus" "$CPAMP_BIN"
-        if [ "$CTL" != "none" ]; then
-            $CTL start "$CPAMP_SVC_NAME"
-        elif [ "$USE_RUN_SH" -eq 1 ]; then
-            nohup "$CPAMP_BASE_DIR/run.sh" >> "$CPAMP_BASE_DIR/cpa-manager-plus.log" 2>&1 &
+        log_err "❌ CPAMP 服务启动失败！"
+        if [ "$DO_BACKUP" = "1" ] && [ -f "$BACKUP_DIR/cpa-manager-plus" ]; then
+            log_warn "正在自动回滚..."
+            cp -f "$BACKUP_DIR/cpa-manager-plus" "$CPAMP_BIN"
+            if [ "$CTL" != "none" ]; then
+                $CTL start "$CPAMP_SVC_NAME"
+            elif [ "$USE_RUN_SH" -eq 1 ]; then
+                nohup "$CPAMP_BASE_DIR/run.sh" >> "$CPAMP_BASE_DIR/cpa-manager-plus.log" 2>&1 &
+            fi
+            log_warn "已回滚至备份版本。"
         fi
-        log_warn "已回滚至备份版本。"
     fi
 
     rm -rf "$TMP_DIR"
 }
 
 # ------------------------------------------------------------------------------
-# 5. 主入口菜单
+# 5. 主入口与二级备份菜单
 # ------------------------------------------------------------------------------
+prompt_backup_choice() {
+    local target_name="$1"
+    echo -e "\n${YELLOW}=== 请选择【${target_name}】升级模式 ===${NC}"
+    echo "1. 备份后升级 (推荐，安全有保障，支持自动回滚)"
+    echo "2. 无备份直接升级 (适合小硬盘 VPS，不保留备份文件)"
+    read -r -p "请选择升级模式 [1-2] (默认 1): " sub_choice
+    sub_choice="${sub_choice:-1}"
+    if [ "$sub_choice" = "2" ]; then
+        echo "0"
+    else
+        echo "1"
+    fi
+}
+
 main() {
     echo -e "${GREEN}====================================================${NC}"
     echo -e "${GREEN}    CLIProxyAPI & CPA Manager Plus 一键升级工具     ${NC}"
@@ -514,14 +554,20 @@ main() {
 
     case "$choice" in
         1)
-            upgrade_cpa
-            upgrade_cpamp
+            local DO_BACKUP
+            DO_BACKUP=$(prompt_backup_choice "全部 (CPA + CPAMP)")
+            upgrade_cpa "$DO_BACKUP"
+            upgrade_cpamp "$DO_BACKUP"
             ;;
         2)
-            upgrade_cpa
+            local DO_BACKUP
+            DO_BACKUP=$(prompt_backup_choice "CLIProxyAPI")
+            upgrade_cpa "$DO_BACKUP"
             ;;
         3)
-            upgrade_cpamp
+            local DO_BACKUP
+            DO_BACKUP=$(prompt_backup_choice "CPA Manager Plus")
+            upgrade_cpamp "$DO_BACKUP"
             ;;
         4)
             log_info "已取消。"
