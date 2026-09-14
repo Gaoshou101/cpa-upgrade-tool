@@ -4,6 +4,7 @@
 # 支持架构：x86_64 (amd64) / aarch64 (arm64)
 # 支持服务管理：systemctl --user / sudo systemctl / run.sh nohup 进程管理
 # 支持操作模式：全新一键安装部署 / 智能版本升级 (带备份/无备份)
+# 安装完成高亮展示：CPA Management Key 与 CPAMP 管理员密钥
 # ==============================================================================
 
 set -euo pipefail
@@ -14,6 +15,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
@@ -115,10 +117,39 @@ extract_execstart_from_service() {
 }
 
 # ------------------------------------------------------------------------------
-# 3. 全新一键安装模块
+# 3. 密钥读取与展示辅助
+# ------------------------------------------------------------------------------
+get_cpa_management_key() {
+    local config_file="$1"
+    if [ -f "$config_file" ]; then
+        local raw
+        raw=$(grep -A 5 -E '^[[:space:]]*remote-management:' "$config_file" 2>/dev/null | grep -E '^[[:space:]]*secret-key:' | head -n 1 || true)
+        if [ -z "$raw" ]; then
+            raw=$(grep -E '^[[:space:]]*secret-key:' "$config_file" 2>/dev/null | head -n 1 || true)
+        fi
+        echo "$raw" | awk -F':' '{print $2}' | tr -d ' "[:space:]' || true
+    fi
+}
+
+get_cpamp_admin_key() {
+    local base_dir="$1"
+    local key=""
+    # 1. 官方标准路径 secrets/cpamp-admin-key
+    if [ -f "$base_dir/secrets/cpamp-admin-key" ]; then
+        key=$(cat "$base_dir/secrets/cpamp-admin-key" 2>/dev/null | tr -d '\r\n ' || true)
+    fi
+    # 2. 从日志搜索生成的初始 admin key
+    if [ -z "$key" ] && [ -f "$base_dir/cpa-manager-plus.log" ]; then
+        key=$(grep -oE 'cmp_admin_[a-zA-Z0-9_-]+' "$base_dir/cpa-manager-plus.log" 2>/dev/null | tail -n 1 || true)
+    fi
+    echo "$key"
+}
+
+# ------------------------------------------------------------------------------
+# 4. 全新一键安装模块
 # ------------------------------------------------------------------------------
 
-# 3.1 一键安装 CLIProxyAPI (CPA)
+# 4.1 一键安装 CLIProxyAPI (CPA)
 install_cpa() {
     log_step "开始全新安装 CLIProxyAPI (CPA)"
 
@@ -162,19 +193,33 @@ install_cpa() {
     cp -f "$NEW_BIN" "$INSTALL_DIR/cli-proxy-api"
     chmod +x "$INSTALL_DIR/cli-proxy-api"
 
-    # 检查并生成默认 config.yaml
+    # 生成随机强秘钥作为 CPA Management Key
+    local GEN_CPA_KEY="cpa_$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 24 || date +%s%N | sha256sum | head -c 24)"
+
+    # 检查并配置 config.yaml
     if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
         log_info "生成初始配置文件: $INSTALL_DIR/config.yaml"
         local EXAMPLE_CONF=$(find "$TMP_DIR" -type f -name "config.example.yaml" | head -n 1 || true)
         if [ -n "$EXAMPLE_CONF" ] && [ -f "$EXAMPLE_CONF" ]; then
             cp "$EXAMPLE_CONF" "$INSTALL_DIR/config.yaml"
+            # 确保开启 remote-management 并设置密钥
+            if grep -q "remote-management:" "$INSTALL_DIR/config.yaml"; then
+                sed -i "/remote-management:/,/secret-key:/ s/secret-key:.*/secret-key: \"$GEN_CPA_KEY\"/" "$INSTALL_DIR/config.yaml" || true
+                sed -i "/remote-management:/,/allow-remote:/ s/allow-remote:.*/allow-remote: true/" "$INSTALL_DIR/config.yaml" || true
+            else
+                cat << EOF_APPEND >> "$INSTALL_DIR/config.yaml"
+
+remote-management:
+  allow-remote: true
+  secret-key: "$GEN_CPA_KEY"
+EOF_APPEND
+            fi
         else
-            cat << 'EOF_CONFIG' > "$INSTALL_DIR/config.yaml"
-# CLIProxyAPI 基本配置
+            cat << EOF_CONFIG > "$INSTALL_DIR/config.yaml"
 port: 8317
 remote-management:
   allow-remote: true
-  secret-key: "cpa_secret_key"
+  secret-key: "$GEN_CPA_KEY"
 EOF_CONFIG
         fi
     fi
@@ -207,18 +252,28 @@ EOF_SVC
     rm -rf "$TMP_DIR"
     sleep 2
 
+    local REAL_CPA_KEY
+    REAL_CPA_KEY=$(get_cpa_management_key "$INSTALL_DIR/config.yaml")
+    REAL_CPA_KEY="${REAL_CPA_KEY:-$GEN_CPA_KEY}"
+
     if systemctl --user is-active cliproxyapi.service >/dev/null 2>&1; then
         log_succ "🎉 CLIProxyAPI (CPA) 安装并启动成功！"
-        log_info "监听端口: 8317"
-        log_info "安装路径: $INSTALL_DIR/cli-proxy-api"
-        log_info "服务管理: systemctl --user status cliproxyapi.service"
     else
-        log_warn "CPA 已安装到 $INSTALL_DIR，但服务启动未通过，可通过以下命令查看原因："
-        log_warn "journalctl --user -u cliproxyapi.service -n 20"
+        log_warn "CPA 已安装到 $INSTALL_DIR，但服务启动未通过，可检查 systemctl --user status cliproxyapi.service。"
     fi
+
+    echo -e "\n${GREEN}==============================================================${NC}"
+    echo -e "${BOLD}${CYAN}            CLIProxyAPI (CPA) 安装配置信息                    ${NC}"
+    echo -e "${GREEN}==============================================================${NC}"
+    echo -e "🔹 安装路径:            ${BOLD}${INSTALL_DIR}/cli-proxy-api${NC}"
+    echo -e "🔹 配置文件:            ${BOLD}${INSTALL_DIR}/config.yaml${NC}"
+    echo -e "🔹 服务监听端口:        ${BOLD}8317${NC}"
+    echo -e "🔑 ${YELLOW}${BOLD}CPA Management Key:  ${RED}${BOLD}${REAL_CPA_KEY}${NC}"
+    echo -e "${GREEN}==============================================================${NC}"
+    echo -e "${YELLOW}提示: 请妥善保存该 Key，后续 CPAMP 面板对接 CPA 时需要填入此项。${NC}\n"
 }
 
-# 3.2 一键安装 CPA Manager Plus (CPAMP)
+# 4.2 一键安装 CPA Manager Plus (CPAMP)
 install_cpamp() {
     log_step "开始全新安装 CPA Manager Plus (CPAMP)"
     log_info "将调用官方最新的一键安装器进行标准化原生部署..."
@@ -235,13 +290,61 @@ install_cpamp() {
     chmod +x "$TMP_DIR/install-cpamp.sh"
     bash "$TMP_DIR/install-cpamp.sh"
     rm -rf "$TMP_DIR"
+
+    # 安装完成后扫描 CPAMP 根目录与密钥
+    local CPAMP_DIR=""
+    for candidate in "$HOME/cpa-manager-plus" "/opt/cpa-manager-plus"; do
+        if [ -d "$candidate" ]; then
+            CPAMP_DIR="$candidate"
+            break
+        fi
+    done
+
+    if [ -n "$CPAMP_DIR" ]; then
+        local ADMIN_KEY
+        ADMIN_KEY=$(get_cpamp_admin_key "$CPAMP_DIR")
+        echo -e "\n${GREEN}==============================================================${NC}"
+        echo -e "${BOLD}${CYAN}         CPA Manager Plus (CPAMP) 部署配置信息                ${NC}"
+        echo -e "${GREEN}==============================================================${NC}"
+        echo -e "🔹 安装路径:            ${BOLD}${CPAMP_DIR}${NC}"
+        echo -e "🔹 Web 面板端口:        ${BOLD}18317${NC} (http://<VPS_IP>:18317)"
+        if [ -n "$ADMIN_KEY" ]; then
+            echo -e "🔑 ${YELLOW}${BOLD}CPAMP 管理员密钥:    ${RED}${BOLD}${ADMIN_KEY}${NC}"
+        else
+            echo -e "🔑 ${YELLOW}${BOLD}CPAMP 管理员密钥:    ${NC}请查看 ${CPAMP_DIR}/secrets/cpamp-admin-key"
+        fi
+        echo -e "${GREEN}==============================================================${NC}"
+        echo -e "${YELLOW}提示: 打开浏览器访问 :18317，使用此管理员密钥直接登录即可。${NC}\n"
+    fi
+}
+
+# 4.3 一键安装全部套件
+install_all() {
+    log_step "准备安装全部套件 (CPA + CPAMP)"
+    install_cpa
+    install_cpamp
+
+    # 汇总输出两大核心密钥
+    local CPA_KEY
+    CPA_KEY=$(get_cpa_management_key "$HOME/cliproxyapi/config.yaml")
+    local CPAMP_KEY
+    CPAMP_KEY=$(get_cpamp_admin_key "$HOME/cpa-manager-plus")
+
+    echo -e "\n${GREEN}==============================================================${NC}"
+    echo -e "${BOLD}${CYAN}       🎉 全部部署完成！核心凭证汇总清单 (请截图或保存)       ${NC}"
+    echo -e "${GREEN}==============================================================${NC}"
+    echo -e "🔑 ${YELLOW}${BOLD}1. CPA Management Key:    ${RED}${BOLD}${CPA_KEY:-未检测到}${NC}"
+    echo -e "🔑 ${YELLOW}${BOLD}2. CPAMP 管理员密钥:       ${RED}${BOLD}${CPAMP_KEY:-未检测到}${NC}"
+    echo -e "🔹 CPA 服务地址:             ${BOLD}http://127.0.0.1:8317${NC}"
+    echo -e "🔹 CPAMP Web 访问地址:       ${BOLD}http://<VPS_IP>:18317${NC}"
+    echo -e "${GREEN}==============================================================${NC}\n"
 }
 
 # ------------------------------------------------------------------------------
-# 4. 智能升级模块 (含备份/无备份模式)
+# 5. 智能升级模块 (含备份/无备份模式)
 # ------------------------------------------------------------------------------
 
-# 4.1 升级 CLIProxyAPI (CPA)
+# 5.1 升级 CLIProxyAPI (CPA)
 upgrade_cpa() {
     local DO_BACKUP="${1:-1}"
     log_step "准备升级 CLIProxyAPI (CPA)"
@@ -408,9 +511,16 @@ upgrade_cpa() {
     fi
 
     rm -rf "$TMP_DIR"
+
+    # 输出 Management Key
+    local CPA_KEY
+    CPA_KEY=$(get_cpa_management_key "$CPA_DIR/config.yaml")
+    if [ -n "$CPA_KEY" ]; then
+        echo -e "\n🔑 ${YELLOW}${BOLD}当前 CPA Management Key:  ${RED}${BOLD}${CPA_KEY}${NC}\n"
+    fi
 }
 
-# 4.2 升级 CPA Manager Plus (CPAMP)
+# 5.2 升级 CPA Manager Plus (CPAMP)
 upgrade_cpamp() {
     local DO_BACKUP="${1:-1}"
     log_step "准备升级 CPA Manager Plus (CPAMP)"
@@ -636,10 +746,17 @@ upgrade_cpamp() {
     fi
 
     rm -rf "$TMP_DIR"
+
+    # 输出 Admin Key
+    local ADMIN_KEY
+    ADMIN_KEY=$(get_cpamp_admin_key "$CPAMP_BASE_DIR")
+    if [ -n "$ADMIN_KEY" ]; then
+        echo -e "\n🔑 ${YELLOW}${BOLD}当前 CPAMP 管理员密钥:  ${RED}${BOLD}${ADMIN_KEY}${NC}\n"
+    fi
 }
 
 # ------------------------------------------------------------------------------
-# 5. 交互菜单与入口
+# 6. 交互菜单与入口
 # ------------------------------------------------------------------------------
 prompt_backup_choice() {
     local target_name="$1"
@@ -701,8 +818,7 @@ menu_install() {
 
     case "$in_choice" in
         1)
-            install_cpa
-            install_cpamp
+            install_all
             ;;
         2)
             install_cpa
@@ -724,7 +840,7 @@ main() {
     echo -e "${GREEN}      CLIProxyAPI & CPA Manager Plus 综合管理工具箱            ${NC}"
     echo -e "${GREEN}==============================================================${NC}"
     echo "1. 智能版本升级 (支持 CPA/CPAMP、全自动探测、备份/小硬盘无备份模式)"
-    echo "2. 全新一键安装 (支持 CPA 原生/守护、CPAMP 标准化安装)"
+    echo "2. 全新一键安装 (支持 CPA 原生/守护、CPAMP 标准化安装、密钥大字报输出)"
     echo "3. 退出"
     read -r -p "请选择操作 [1-3] (默认 1): " main_choice
     main_choice="${main_choice:-1}"
