@@ -534,6 +534,61 @@ upgrade_cpamp() {
     local CPAMP_BIN=""
     local CPAMP_BASE_DIR=""
 
+    # 探测函数：给定一个候选根目录，提取有效基准目录与二进制路径
+    resolve_from_base_dir() {
+        local bdir="$1"
+        bdir="${bdir%/}"
+        [ -d "$bdir" ] || return 1
+
+        # 检查是否本身就是 runtime/package 目录
+        if [ -f "$bdir/cpa-manager-plus" ]; then
+            CPAMP_BIN="$bdir/cpa-manager-plus"
+            if [ -f "$bdir/../../run.sh" ]; then
+                CPAMP_BASE_DIR=$(readlink -f "$bdir/../..")
+            elif [ -f "$bdir/run.sh" ]; then
+                CPAMP_BASE_DIR="$bdir"
+            else
+                CPAMP_BASE_DIR="$bdir"
+            fi
+            return 0
+        fi
+
+        # 检查 run.sh
+        if [ -f "$bdir/run.sh" ]; then
+            CPAMP_BASE_DIR="$bdir"
+            # 尝试从 run.sh 的 cd 语句提取 runtime 目录
+            local target_dir
+            target_dir=$(grep -E '^[[:space:]]*cd[[:space:]]+' "$bdir/run.sh" | awk '{print $2}' | tr -d '"' || true)
+            if [ -n "$target_dir" ]; then
+                case "$target_dir" in
+                    /*) ;;
+                    *) target_dir="$bdir/$target_dir" ;;
+                esac
+                if [ -f "$target_dir/cpa-manager-plus" ]; then
+                    CPAMP_BIN="$target_dir/cpa-manager-plus"
+                    return 0
+                fi
+            fi
+        fi
+
+        # 检查 runtime 目录下的所有 cpa-manager-plus 二进制
+        local found
+        found=$(find "$bdir" -type f -name "cpa-manager-plus" 2>/dev/null | head -n 1 || true)
+        if [ -n "$found" ] && [ -f "$found" ]; then
+            CPAMP_BIN="$found"
+            CPAMP_BASE_DIR="$bdir"
+            return 0
+        fi
+
+        # 如果存在官方结构标记（run.sh 或 data 目录），即认定为根目录
+        if [ -f "$bdir/run.sh" ] || [ -d "$bdir/data" ] || [ -f "$bdir/cpa-manager-plus.pid" ]; then
+            CPAMP_BASE_DIR="$bdir"
+            return 0
+        fi
+
+        return 1
+    }
+
     # 策略 1: 从正在运行的进程提取
     local PID_PATH
     PID_PATH=$(pgrep -f "cpa-manager-plus" 2>/dev/null | head -n 1 || true)
@@ -543,6 +598,14 @@ upgrade_cpamp() {
         if [ -f "$EXE_LINK" ]; then
             CPAMP_BIN="$EXE_LINK"
             log_info "通过运行进程精准探测到 CPAMP: $CPAMP_BIN"
+            local edir=$(dirname "$CPAMP_BIN")
+            if [ -f "$edir/../../run.sh" ]; then
+                CPAMP_BASE_DIR=$(readlink -f "$edir/../..")
+            elif [ -f "$edir/run.sh" ]; then
+                CPAMP_BASE_DIR="$edir"
+            else
+                CPAMP_BASE_DIR="$edir"
+            fi
         fi
     fi
 
@@ -551,72 +614,63 @@ upgrade_cpamp() {
         CPAMP_BIN=$(extract_execstart_from_service "$CPAMP_SVC_NAME" || true)
         if [ -n "$CPAMP_BIN" ]; then
             log_info "通过 systemd 服务配置提取到 CPAMP: $CPAMP_BIN"
+            local sdir=$(dirname "$CPAMP_BIN")
+            if [ -f "$sdir/../../run.sh" ]; then
+                CPAMP_BASE_DIR=$(readlink -f "$sdir/../..")
+            else
+                CPAMP_BASE_DIR="$sdir"
+            fi
         fi
     fi
 
-    # 策略 3: 从 PATH 获取
-    if [ -z "$CPAMP_BIN" ]; then
-        CPAMP_BIN=$(command -v cpa-manager-plus || which cpa-manager-plus 2>/dev/null || true)
-    fi
-
-    # 策略 4: 扫描默认路径
-    if [ -z "$CPAMP_BIN" ]; then
-        local search_paths=(
-            "$HOME/cpa-manager-plus/run.sh"
-            "$HOME/cpa-manager-plus/cpa-manager-plus"
-            "/opt/cpa-manager-plus/run.sh"
-            "/opt/cpa-manager-plus/cpa-manager-plus"
-            "$HOME/cpa-manager/run.sh"
-            "$HOME/cpa-manager/cpa-manager-plus"
-            "$HOME/bin/cpa-manager-plus"
-            "$HOME/.local/bin/cpa-manager-plus"
-            "/usr/local/bin/cpa-manager-plus"
-        )
-        for p in "${search_paths[@]}"; do
-            if [ -f "$p" ]; then
-                if [[ "$p" == *"/run.sh" ]]; then
-                    CPAMP_BASE_DIR=$(dirname "$p")
-                    CPAMP_BIN=$(find "$CPAMP_BASE_DIR" -type f -name "cpa-manager-plus" 2>/dev/null | head -n 1 || true)
-                else
-                    CPAMP_BIN="$p"
-                fi
+    # 策略 3: 从常见官方目录自动探测
+    if [ -z "$CPAMP_BASE_DIR" ]; then
+        for candidate_dir in "$HOME/cpa-manager-plus" "/root/cpa-manager-plus" "/opt/cpa-manager-plus" "$HOME/cpa-manager"; do
+            if resolve_from_base_dir "$candidate_dir"; then
+                log_info "自动识别到 CPAMP 目录: $CPAMP_BASE_DIR"
                 break
             fi
         done
     fi
 
-    # 策略 5: 提示用户输入
+    # 策略 4: 从 PATH 获取
     if [ -z "$CPAMP_BIN" ]; then
-        read -r -p "未自动检测到 CPAMP 路径，请输入文件或目录 (例如 $HOME/cpa-manager-plus): " INPUT_PATH
-        INPUT_PATH="${INPUT_PATH/#\~/$HOME}"
-        if [ -d "$INPUT_PATH" ]; then
-            CPAMP_BASE_DIR="$INPUT_PATH"
-            CPAMP_BIN=$(find "$INPUT_PATH" -type f -name "cpa-manager-plus" 2>/dev/null | head -n 1 || true)
-        elif [ -f "$INPUT_PATH" ]; then
-            CPAMP_BIN="$INPUT_PATH"
+        local path_cmd
+        path_cmd=$(command -v cpa-manager-plus || which cpa-manager-plus 2>/dev/null || true)
+        if [ -n "$path_cmd" ] && [ -f "$path_cmd" ]; then
+            CPAMP_BIN="$path_cmd"
+            CPAMP_BASE_DIR=$(dirname "$path_cmd")
         fi
     fi
 
-    if [ -z "$CPAMP_BIN" ] || [ ! -f "$CPAMP_BIN" ]; then
-        log_err "未能定位到 CPAMP 可执行文件，跳过 CPAMP 升级。"
+    # 策略 5: 提示用户输入
+    if [ -z "$CPAMP_BASE_DIR" ] && [ -z "$CPAMP_BIN" ]; then
+        read -r -p "未自动检测到 CPAMP 路径，请输入安装目录或文件 (例如 $HOME/cpa-manager-plus): " INPUT_PATH
+        INPUT_PATH="${INPUT_PATH/#\~/$HOME}"
+        INPUT_PATH="${INPUT_PATH%/}"
+        if [ -d "$INPUT_PATH" ]; then
+            resolve_from_base_dir "$INPUT_PATH" || true
+        elif [ -f "$INPUT_PATH" ]; then
+            CPAMP_BIN="$INPUT_PATH"
+            CPAMP_BASE_DIR=$(dirname "$INPUT_PATH")
+        fi
+    fi
+
+    # 校验是否定位成功
+    if [ -z "$CPAMP_BASE_DIR" ] && [ -z "$CPAMP_BIN" ]; then
+        log_err "未能定位到 CPAMP 安装路径或二进制，跳过 CPAMP 升级。"
         return 1
     fi
 
-    local CPAMP_DIR=$(dirname "$CPAMP_BIN")
-    if [ -z "$CPAMP_BASE_DIR" ]; then
-        if [ -f "$CPAMP_DIR/../../run.sh" ]; then
-            CPAMP_BASE_DIR=$(readlink -f "$CPAMP_DIR/../..")
-        elif [ -f "$CPAMP_DIR/run.sh" ]; then
-            CPAMP_BASE_DIR="$CPAMP_DIR"
-        else
-            CPAMP_BASE_DIR="$CPAMP_DIR"
-        fi
+    # 如果只有 BASE_DIR 没有找到旧 BIN，尝试最终搜寻一次
+    if [ -z "$CPAMP_BIN" ] && [ -n "$CPAMP_BASE_DIR" ]; then
+        CPAMP_BIN=$(find "$CPAMP_BASE_DIR" -type f -name "cpa-manager-plus" 2>/dev/null | head -n 1 || true)
     fi
 
     local CTL=$(detect_service_cmd "$CPAMP_SVC_NAME")
     local USE_RUN_SH=0
     if [ "$CTL" = "none" ]; then
-        if [ -f "$CPAMP_BASE_DIR/run.sh" ]; then
+        if [ -n "$CPAMP_BASE_DIR" ] && [ -f "$CPAMP_BASE_DIR/run.sh" ]; then
             USE_RUN_SH=1
             log_info "未注册 systemd 服务，检测到官方启动脚本: $CPAMP_BASE_DIR/run.sh"
         else
@@ -626,10 +680,10 @@ upgrade_cpamp() {
         log_info "检测到 systemd 服务管理方式: $CTL $CPAMP_SVC_NAME"
     fi
 
-    log_info "CPAMP 目标文件: $CPAMP_BIN"
-    log_info "CPAMP 所在目录: $CPAMP_DIR"
-    log_info "CPAMP 项目根目录: $CPAMP_BASE_DIR"
+    log_info "CPAMP 项目根目录: ${CPAMP_BASE_DIR:-未知}"
+    log_info "CPAMP 二进制文件: ${CPAMP_BIN:-待升级写入}"
 
+    # 获取最新版本 tag
     log_info "正在获取 CPAMP 最新 Release 版本..."
     local LATEST_JSON=$(curl -sL "${GH_PROXY}https://api.github.com/repos/seakee/CPA-Manager-Plus/releases/latest")
     local TAG=$(echo "$LATEST_JSON" | grep -Po '"tag_name":\s*"\K[^"]+' || true)
@@ -664,7 +718,7 @@ upgrade_cpamp() {
     if [ "$CTL" != "none" ]; then
         log_info "停止服务: $CTL stop $CPAMP_SVC_NAME"
         $CTL stop "$CPAMP_SVC_NAME" || true
-    elif [ "$USE_RUN_SH" -eq 1 ] && [ -f "$CPAMP_BASE_DIR/cpa-manager-plus.pid" ]; then
+    elif [ "$USE_RUN_SH" -eq 1 ] && [ -n "$CPAMP_BASE_DIR" ] && [ -f "$CPAMP_BASE_DIR/cpa-manager-plus.pid" ]; then
         local OLD_PID=$(cat "$CPAMP_BASE_DIR/cpa-manager-plus.pid" 2>/dev/null || true)
         if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" >/dev/null 2>&1; then
             log_info "停止原有 CPAMP 进程 (PID: $OLD_PID)..."
@@ -676,36 +730,42 @@ upgrade_cpamp() {
     fi
 
     # 备份关键数据（按需）
-    local BACKUP_DIR="${CPAMP_BASE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
-    if [ "$DO_BACKUP" = "1" ]; then
+    local BACKUP_DIR="${CPAMP_BASE_DIR:-/tmp}/backup_$(date +%Y%m%d_%H%M%S)"
+    if [ "$DO_BACKUP" = "1" ] && [ -n "$CPAMP_BASE_DIR" ]; then
         mkdir -p "$BACKUP_DIR"
         log_info "正在冷备份 CPAMP 数据到 $BACKUP_DIR ..."
-        cp -a "$CPAMP_BIN" "$BACKUP_DIR/"
+        if [ -n "$CPAMP_BIN" ] && [ -f "$CPAMP_BIN" ]; then
+            cp -a "$CPAMP_BIN" "$BACKUP_DIR/" 2>/dev/null || true
+        fi
         for d in "data" "secrets" "config.json"; do
             if [ -e "$CPAMP_BASE_DIR/$d" ]; then
-                cp -a "$CPAMP_BASE_DIR/$d" "$BACKUP_DIR/"
-            fi
-            if [ -e "$CPAMP_DIR/$d" ] && [ "$CPAMP_DIR" != "$CPAMP_BASE_DIR" ]; then
-                cp -a "$CPAMP_DIR/$d" "$BACKUP_DIR/"
+                cp -a "$CPAMP_BASE_DIR/$d" "$BACKUP_DIR/" 2>/dev/null || true
             fi
         done
     else
         log_info "跳过冷备份数据以节省硬盘空间..."
     fi
 
-    # 替换文件
+    # 替换或安装文件
     log_info "应用新版本文件..."
     local EXTRACTED_TOP=$(dirname "$NEW_BIN")
-    if [ "$CPAMP_DIR" = "$CPAMP_BASE_DIR" ]; then
-        if command -v rsync >/dev/null 2>&1; then
-            rsync -av --exclude="config.json" --exclude="data" --exclude="secrets" --exclude="*.sqlite*" "$EXTRACTED_TOP/" "$CPAMP_DIR/" 2>/dev/null || cp -f "$NEW_BIN" "$CPAMP_BIN"
-        else
-            cp -f "$NEW_BIN" "$CPAMP_BIN"
-        fi
-    else
+    local TARGET_DIR=""
+
+    if [ -n "$CPAMP_BIN" ] && [ -f "$CPAMP_BIN" ]; then
+        TARGET_DIR=$(dirname "$CPAMP_BIN")
         cp -f "$NEW_BIN" "$CPAMP_BIN"
-        if [ -d "$EXTRACTED_TOP/dist" ]; then
-            cp -rf "$EXTRACTED_TOP/dist" "$CPAMP_DIR/" 2>/dev/null || true
+    elif [ -n "$CPAMP_BASE_DIR" ]; then
+        local RUNTIME_PKG="cpa-manager-plus_${TAG}_linux_${CPAMP_ARCH}"
+        TARGET_DIR="$CPAMP_BASE_DIR/runtime/$RUNTIME_PKG"
+        mkdir -p "$TARGET_DIR"
+        cp -rf "$EXTRACTED_TOP/"* "$TARGET_DIR/"
+        chmod +x "$TARGET_DIR/cpa-manager-plus"
+        CPAMP_BIN="$TARGET_DIR/cpa-manager-plus"
+
+        # 如果有 run.sh，更新其中的 cd 目标目录为最新 runtime
+        if [ -f "$CPAMP_BASE_DIR/run.sh" ]; then
+            sed -i -E "s|cd ".*runtime/cpa-manager-plus_.*"|cd "$TARGET_DIR"|g" "$CPAMP_BASE_DIR/run.sh" || true
+            sed -i -E "s|# CPAMP_RUNTIME_PACKAGE=.*|# CPAMP_RUNTIME_PACKAGE=$RUNTIME_PKG|g" "$CPAMP_BASE_DIR/run.sh" || true
         fi
     fi
 
@@ -713,14 +773,14 @@ upgrade_cpamp() {
     log_info "重新启动 CPAMP..."
     if [ "$CTL" != "none" ]; then
         $CTL start "$CPAMP_SVC_NAME"
-    elif [ "$USE_RUN_SH" -eq 1 ]; then
+    elif [ "$USE_RUN_SH" -eq 1 ] && [ -n "$CPAMP_BASE_DIR" ]; then
         local LOG_FILE="$CPAMP_BASE_DIR/cpa-manager-plus.log"
         local PID_FILE="$CPAMP_BASE_DIR/cpa-manager-plus.pid"
         nohup "$CPAMP_BASE_DIR/run.sh" >> "$LOG_FILE" 2>&1 &
         local NEW_PID=$!
         echo "$NEW_PID" > "$PID_FILE"
         log_info "已通过 run.sh 启动 (PID: $NEW_PID, 日志: $LOG_FILE)"
-    else
+    elif [ -n "$CPAMP_BIN" ] && [ -f "$CPAMP_BIN" ]; then
         nohup "$CPAMP_BIN" >/dev/null 2>&1 &
     fi
 
@@ -733,7 +793,7 @@ upgrade_cpamp() {
         log_succ "✅ CPAMP 升级成功并已正常运行！"
     else
         log_err "❌ CPAMP 服务启动失败！"
-        if [ "$DO_BACKUP" = "1" ] && [ -f "$BACKUP_DIR/cpa-manager-plus" ]; then
+        if [ "$DO_BACKUP" = "1" ] && [ -f "$BACKUP_DIR/cpa-manager-plus" ] && [ -n "$CPAMP_BIN" ]; then
             log_warn "正在自动回滚..."
             cp -f "$BACKUP_DIR/cpa-manager-plus" "$CPAMP_BIN"
             if [ "$CTL" != "none" ]; then
@@ -748,10 +808,12 @@ upgrade_cpamp() {
     rm -rf "$TMP_DIR"
 
     # 输出 Admin Key
-    local ADMIN_KEY
-    ADMIN_KEY=$(get_cpamp_admin_key "$CPAMP_BASE_DIR")
-    if [ -n "$ADMIN_KEY" ]; then
-        echo -e "\n🔑 ${YELLOW}${BOLD}当前 CPAMP 管理员密钥:  ${RED}${BOLD}${ADMIN_KEY}${NC}\n"
+    if [ -n "$CPAMP_BASE_DIR" ]; then
+        local ADMIN_KEY
+        ADMIN_KEY=$(get_cpamp_admin_key "$CPAMP_BASE_DIR")
+        if [ -n "$ADMIN_KEY" ]; then
+            echo -e "\n🔑 ${YELLOW}${BOLD}当前 CPAMP 管理员密钥:  ${RED}${BOLD}${ADMIN_KEY}${NC}\n"
+        fi
     fi
 }
 
