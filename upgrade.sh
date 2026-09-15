@@ -495,6 +495,9 @@ upgrade_cpa() {
         sleep 2
         if $CTL is-active "$CPA_SVC_NAME" >/dev/null 2>&1; then
             log_succ "✅ CPA 升级成功并已正常运行！"
+            if [ "$DO_BACKUP" = "0" ] && [ -d "$CPA_DIR/config_backup" ]; then
+                rm -rf "$CPA_DIR/config_backup"/* 2>/dev/null || true
+            fi
         else
             log_err "❌ CPA 服务启动异常！"
             if [ "$DO_BACKUP" = "1" ] && [ -f "$BACKUP_BIN" ]; then
@@ -791,6 +794,27 @@ upgrade_cpamp() {
     if [ -n "$HEALTH" ] || pgrep -f "cpa-manager-plus" >/dev/null 2>&1; then
         log_info "健康检查响应: ${HEALTH:-已正常运行}"
         log_succ "✅ CPAMP 升级成功并已正常运行！"
+
+        # 小硬盘极简模式：自动深度瘦身，清理 runtime 中的旧版本目录与 downloads 缓存
+        if [ "$DO_BACKUP" = "0" ] && [ -n "$CPAMP_BASE_DIR" ]; then
+            log_info "正在执行小硬盘专属瘦身清理..."
+            # 清理 downloads/ 下的安装包
+            if [ -d "$CPAMP_BASE_DIR/downloads" ]; then
+                rm -rf "$CPAMP_BASE_DIR/downloads"/* 2>/dev/null || true
+                log_info "已清理安装包缓存: $CPAMP_BASE_DIR/downloads"
+            fi
+            # 清理 runtime/ 下除当前运行版本之外的旧历史版本目录
+            if [ -d "$CPAMP_BASE_DIR/runtime" ] && [ -n "$TARGET_DIR" ]; then
+                local cleaned_count=0
+                for old_ver in "$CPAMP_BASE_DIR"/runtime/*; do
+                    if [ -d "$old_ver" ] && [ "$old_ver" != "$TARGET_DIR" ]; then
+                        rm -rf "$old_ver" 2>/dev/null || true
+                        cleaned_count=$((cleaned_count + 1))
+                    fi
+                done
+                log_info "已自动清理 runtime 中 ${cleaned_count} 个旧版本残留目录，释放磁盘空间！"
+            fi
+        fi
     else
         log_err "❌ CPAMP 服务启动失败！"
         if [ "$DO_BACKUP" = "1" ] && [ -f "$BACKUP_DIR/cpa-manager-plus" ] && [ -n "$CPAMP_BIN" ]; then
@@ -822,9 +846,10 @@ upgrade_cpamp() {
 # ------------------------------------------------------------------------------
 prompt_backup_choice() {
     local target_name="$1"
-    echo -e "\n${YELLOW}=== 请选择【${target_name}】升级模式 ===${NC}"
-    echo "1. 备份后升级 (推荐，安全有保障，支持自动回滚)"
-    echo "2. 无备份直接升级 (适合小硬盘 VPS，不保留备份文件)"
+    echo -e "\n${YELLOW}=== 请选择【${target_name}】升级模式 ===${NC}" >&2
+    echo "1. 备份后升级 (推荐，安全有保障，升级前快照冷备，异常可自动回滚)" >&2
+    echo "2. 无备份直接升级 (适合小硬盘 VPS，不生成备份，升级后自动瘦身清理旧版本)" >&2
+    local sub_choice=""
     read -r -p "请选择升级模式 [1-2] (默认 1): " sub_choice
     sub_choice="${sub_choice:-1}"
     if [ "$sub_choice" = "2" ]; then
