@@ -2,8 +2,10 @@
 # ==============================================================================
 # CLIProxyAPI (CPA) & CPA Manager Plus (CPAMP) 一键部署与升级维护管理工具
 # 支持架构：x86_64 (amd64) / aarch64 (arm64)
+# 支持变体：GLIBC 默认版 (支持动态库插件) / musl & OpenWrt 便携版 (no-plugin)
 # 支持服务管理：systemctl --user / sudo systemctl / run.sh nohup 进程管理
 # 支持操作模式：全新一键安装部署 / 智能版本升级 (带备份/无备份)
+# 核心容错：动态解析 Release 资产包名 + 上游空壳/构建失败 Release 自动回退
 # 安装完成高亮展示：CPA Management Key 与 CPAMP 管理员密钥
 # ==============================================================================
 
@@ -32,10 +34,12 @@ case "$ARCH" in
     x86_64|amd64)
         CPA_ARCH="amd64"
         CPAMP_ARCH="amd64"
+        ARCH_REGEX="amd64|x86_64"
         ;;
     aarch64|arm64)
         CPA_ARCH="aarch64"
         CPAMP_ARCH="arm64"
+        ARCH_REGEX="aarch64|arm64"
         ;;
     *)
         log_err "不支持的系统架构: $ARCH"
@@ -46,7 +50,7 @@ esac
 log_info "系统架构识别: $ARCH (CPA: $CPA_ARCH, CPAMP: $CPAMP_ARCH)"
 
 # 检查常用基础命令
-for cmd in curl tar grep; do
+for cmd in curl tar grep awk sed; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         log_warn "缺少命令 $cmd，尝试自动安装..."
         if command -v apt-get >/dev/null 2>&1; then
@@ -63,6 +67,178 @@ if ! curl -sI -m 3 https://api.github.com >/dev/null 2>&1; then
     log_warn "直接连接 GitHub API 超时，已启用镜像加速代理..."
     GH_PROXY="https://gh.jasonzeng.dev/"
 fi
+
+# ------------------------------------------------------------------------------
+# 1.1 系统 libc / OpenWrt 变体检测与 Release 资产动态解析
+# ------------------------------------------------------------------------------
+is_openwrt_system() {
+    [ -f /etc/openwrt_release ] && return 0
+    if [ -f /etc/os-release ] && grep -qi 'openwrt' /etc/os-release 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+is_musl_system() {
+    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi 'musl'; then
+        return 0
+    fi
+    [ -f /etc/alpine-release ] && return 0
+    local loader
+    for loader in /lib/ld-musl-*.so* /usr/lib/ld-musl-*.so*; do
+        [ -e "$loader" ] && return 0
+    done
+    return 1
+}
+
+detect_cpa_asset_variant() {
+    local cpa_dir="${1:-}"
+    if [ -n "$cpa_dir" ] && [ -f "$cpa_dir/asset-variant.txt" ]; then
+        local saved
+        saved=$(tr -d '\r\n[:space:]' < "$cpa_dir/asset-variant.txt" 2>/dev/null || true)
+        if [ "$saved" = "default" ] || [ "$saved" = "no-plugin" ]; then
+            echo "$saved"
+            return 0
+        fi
+    fi
+    if is_openwrt_system || is_musl_system; then
+        echo "no-plugin"
+    else
+        echo "default"
+    fi
+}
+
+# 检查文件是否为真实二进制（排除 #! 开头的 shell wrapper 脚本）
+is_real_binary() {
+    local fpath="$1"
+    [ -f "$fpath" ] || return 1
+    local magic
+    magic=$(head -c 2 "$fpath" 2>/dev/null || true)
+    if [ "$magic" = "#!" ]; then
+        return 1
+    fi
+    return 0
+}
+
+get_local_cpa_version() {
+    local bin_path="${1:-}"
+    local cpa_dir="${2:-}"
+    local ver=""
+    if [ -n "$bin_path" ] && [ -x "$bin_path" ]; then
+        ver=$("$bin_path" -version 2>&1 | grep -oE 'CLIProxyAPI Version:[[:space:]]*v?[0-9]+\.[0-9]+\.[0-9]+([-a-zA-Z0-9.]*)?' | head -n 1 | awk '{print $NF}' | sed 's/^v//' || true)
+    fi
+    if [ -z "$ver" ] && [ -n "$cpa_dir" ] && [ -f "$cpa_dir/version.txt" ]; then
+        ver=$(tr -d '\r\n[:space:]' < "$cpa_dir/version.txt" 2>/dev/null | sed 's/^v//' || true)
+    fi
+    echo "$ver"
+}
+
+get_local_cpamp_version() {
+    local bin_path="${1:-}"
+    local ver=""
+    if [ -n "$bin_path" ] && [ -x "$bin_path" ]; then
+        ver=$("$bin_path" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+([-a-zA-Z0-9.]*)?' | head -n 1 | sed 's/^v//' || true)
+    fi
+    echo "$ver"
+}
+
+# 动态解析 GitHub 最新拥有可用二进制包的 Release
+# 输出格式: RESOLVED_TAG|ASSET_NAME|DOWNLOAD_URL|FIRST_TAG
+resolve_release_asset() {
+    local repo="$1"
+    local arch_regex="$2"
+    local variant="${3:-default}"
+    local api_url="${GH_PROXY}https://api.github.com/repos/${repo}/releases?per_page=10"
+    local result=""
+
+    # 通道 1: 通过 GitHub Releases API 扫描近期版本 (优先使用 python3 解析 JSON)
+    local json_data
+    json_data=$(curl -fsSL -m 15 -H "User-Agent: Mozilla/5.0" "$api_url" 2>/dev/null || true)
+    if [ -n "$json_data" ] && command -v python3 >/dev/null 2>&1; then
+        result=$(printf '%s' "$json_data" | python3 -c '
+import sys, json, re
+arch_re = sys.argv[1]
+variant = sys.argv[2]
+try:
+    data = json.load(sys.stdin)
+    if isinstance(data, dict):
+        data = [data] if "tag_name" in data else []
+    first_tag = data[0].get("tag_name", "") if data else ""
+    for rel in data:
+        if rel.get("draft") or rel.get("prerelease"):
+            continue
+        tag = rel.get("tag_name", "")
+        for a in rel.get("assets", []):
+            name = a.get("name", "")
+            dl = a.get("browser_download_url", "")
+            lname = name.lower()
+            if "linux" not in lname or not (lname.endswith(".tar.gz") or lname.endswith(".tgz")):
+                continue
+            if not re.search(rf"(^|[_.-])({arch_re})([_.-]|$)", lname):
+                continue
+            if variant == "no-plugin":
+                if "no-plugin" not in lname:
+                    continue
+            else:
+                if "no-plugin" in lname:
+                    continue
+            print(f"{tag}|{name}|{dl}|{first_tag}")
+            sys.exit(0)
+except Exception:
+    pass
+' "$arch_regex" "$variant" 2>/dev/null || true)
+    fi
+
+    if [ -n "$result" ]; then
+        echo "$result"
+        return 0
+    fi
+
+    # 通道 2: 免 API 配额兜底 (直接解析 GitHub Releases 页面与 expanded_assets)
+    local releases_html
+    releases_html=$(curl -fsSL -m 15 -H "User-Agent: Mozilla/5.0" "${GH_PROXY}https://github.com/${repo}/releases" 2>/dev/null || true)
+    local tags_list=""
+    if [ -n "$releases_html" ]; then
+        tags_list=$(printf '%s' "$releases_html" | grep -oE "/${repo}/releases/tag/[^\"'?<> ]+" | sed "s|/${repo}/releases/tag/||" | awk '!seen[$0]++' | head -n 8 || true)
+    fi
+
+    if [ -z "$tags_list" ]; then
+        local latest_Single
+        latest_Single=$(curl -fsSL -m 10 -H "User-Agent: Mozilla/5.0" "${GH_PROXY}https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | head -n 1 | cut -d'"' -f4 || true)
+        tags_list="$latest_Single"
+    fi
+
+    local first_tag=""
+    local t
+    for t in $tags_list; do
+        [ -z "$first_tag" ] && first_tag="$t"
+        local assets_html
+        assets_html=$(curl -fsSL -m 12 -H "User-Agent: Mozilla/5.0" "${GH_PROXY}https://github.com/${repo}/releases/expanded_assets/${t}" 2>/dev/null || true)
+        [ -z "$assets_html" ] && continue
+
+        local rel_paths
+        rel_paths=$(printf '%s' "$assets_html" | grep -oE "/${repo}/releases/download/[^\"'?<> ]+" | awk '!seen[$0]++' || true)
+        local rp
+        for rp in $rel_paths; do
+            local fname
+            fname=$(basename "$rp")
+            local lfname
+            lfname=$(echo "$fname" | tr 'A-Z' 'a-z')
+            echo "$lfname" | grep -q "linux" || continue
+            echo "$lfname" | grep -qE '\.(tar\.gz|tgz)$' || continue
+            echo "$lfname" | grep -qE "(^|[_.-])(${arch_regex})([_.-]|$)" || continue
+            if [ "$variant" = "no-plugin" ]; then
+                echo "$lfname" | grep -q "no-plugin" || continue
+            else
+                echo "$lfname" | grep -q "no-plugin" && continue
+            fi
+            echo "${t}|${fname}|https://github.com${rp}|${first_tag}"
+            return 0
+        done
+    done
+
+    return 1
+}
 
 # ------------------------------------------------------------------------------
 # 2. 服务控制检测与进程启停辅助函数
@@ -159,20 +335,33 @@ install_cpa() {
     INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
     mkdir -p "$INSTALL_DIR"
 
-    # 获取最新版本
-    log_info "正在获取 CPA 最新 Release 版本..."
-    local LATEST_JSON=$(curl -sL "${GH_PROXY}https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest")
-    local TAG=$(echo "$LATEST_JSON" | grep -Po '"tag_name":\s*"\K[^"]+' || true)
-    if [ -z "$TAG" ]; then
-        log_err "获取 CPA 最新版本失败，请检查网络！"
+    local VARIANT
+    VARIANT=$(detect_cpa_asset_variant "$INSTALL_DIR")
+    log_info "目标资产变体: $VARIANT ($( [ "$VARIANT" = "no-plugin" ] && echo "musl/OpenWrt 便携静态版" || echo "GLIBC 标准版，支持动态库插件" ))"
+
+    # 获取最新拥有可用资产包的 Release
+    log_info "正在获取 CPA 最新可用 Release 版本与安装包..."
+    local RESOLVED
+    RESOLVED=$(resolve_release_asset "router-for-me/CLIProxyAPI" "$ARCH_REGEX" "$VARIANT" || true)
+    if [ -z "$RESOLVED" ]; then
+        log_err "获取 CPA 最新可用安装包失败，请检查网络或 GitHub 状态！"
         return 1
     fi
-    local CLEAN_VER="${TAG#v}"
-    log_info "CPA 最新版本: $TAG"
 
-    local PKG_NAME="CLIProxyAPI_${CLEAN_VER}_linux_${CPA_ARCH}.tar.gz"
-    local DOWNLOAD_URL="https://github.com/router-for-me/CLIProxyAPI/releases/download/${TAG}/${PKG_NAME}"
-    local TMP_DIR=$(mktemp -d)
+    local TAG PKG_NAME DOWNLOAD_URL LATEST_TAG
+    TAG=$(echo "$RESOLVED" | cut -d'|' -f1)
+    PKG_NAME=$(echo "$RESOLVED" | cut -d'|' -f2)
+    DOWNLOAD_URL=$(echo "$RESOLVED" | cut -d'|' -f3)
+    LATEST_TAG=$(echo "$RESOLVED" | cut -d'|' -f4)
+    local CLEAN_VER="${TAG#v}"
+
+    if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "$TAG" ]; then
+        log_warn "上游最新 Release ($LATEST_TAG) 暂无预编译二进制包 (可能构建失败或正在打包)，已自动选用最新可用版本: $TAG"
+    fi
+    log_info "CPA 目标版本: $TAG (安装包: $PKG_NAME)"
+
+    local TMP_DIR
+    TMP_DIR=$(mktemp -d)
 
     log_info "正在下载: $PKG_NAME ..."
     if ! curl -fSL --progress-bar "${GH_PROXY}${DOWNLOAD_URL}" -o "$TMP_DIR/$PKG_NAME"; then
@@ -183,7 +372,8 @@ install_cpa() {
 
     log_info "解压并安装二进制..."
     tar -xzf "$TMP_DIR/$PKG_NAME" -C "$TMP_DIR"
-    local NEW_BIN=$(find "$TMP_DIR" -type f \( -name "CLIProxyAPI" -o -name "cli-proxy-api" \) | head -n 1)
+    local NEW_BIN
+    NEW_BIN=$(find "$TMP_DIR" -type f \( -name "CLIProxyAPI" -o -name "cli-proxy-api" \) | head -n 1)
     if [ -z "$NEW_BIN" ]; then
         log_err "解压包中未找到二进制文件！"
         rm -rf "$TMP_DIR"
@@ -192,6 +382,8 @@ install_cpa() {
 
     cp -f "$NEW_BIN" "$INSTALL_DIR/cli-proxy-api"
     chmod +x "$INSTALL_DIR/cli-proxy-api"
+    echo "$CLEAN_VER" > "$INSTALL_DIR/version.txt"
+    echo "$VARIANT" > "$INSTALL_DIR/asset-variant.txt"
 
     # 生成随机强秘钥作为 CPA Management Key
     local GEN_CPA_KEY="cpa_$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 24 || date +%s%N | sha256sum | head -c 24)"
@@ -199,10 +391,10 @@ install_cpa() {
     # 检查并配置 config.yaml
     if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
         log_info "生成初始配置文件: $INSTALL_DIR/config.yaml"
-        local EXAMPLE_CONF=$(find "$TMP_DIR" -type f -name "config.example.yaml" | head -n 1 || true)
+        local EXAMPLE_CONF
+        EXAMPLE_CONF=$(find "$TMP_DIR" -type f -name "config.example.yaml" | head -n 1 || true)
         if [ -n "$EXAMPLE_CONF" ] && [ -f "$EXAMPLE_CONF" ]; then
             cp "$EXAMPLE_CONF" "$INSTALL_DIR/config.yaml"
-            # 确保开启 remote-management 并设置密钥
             if grep -q "remote-management:" "$INSTALL_DIR/config.yaml"; then
                 sed -i "/remote-management:/,/secret-key:/ s/secret-key:.*/secret-key: \"$GEN_CPA_KEY\"/" "$INSTALL_DIR/config.yaml" || true
                 sed -i "/remote-management:/,/allow-remote:/ s/allow-remote:.*/allow-remote: true/" "$INSTALL_DIR/config.yaml" || true
@@ -257,7 +449,7 @@ EOF_SVC
     REAL_CPA_KEY="${REAL_CPA_KEY:-$GEN_CPA_KEY}"
 
     if systemctl --user is-active cliproxyapi.service >/dev/null 2>&1; then
-        log_succ "🎉 CLIProxyAPI (CPA) 安装并启动成功！"
+        log_succ "🎉 CLIProxyAPI (CPA) $TAG 安装并启动成功！"
     else
         log_warn "CPA 已安装到 $INSTALL_DIR，但服务启动未通过，可检查 systemctl --user status cliproxyapi.service。"
     fi
@@ -265,6 +457,7 @@ EOF_SVC
     echo -e "\n${GREEN}==============================================================${NC}"
     echo -e "${BOLD}${CYAN}            CLIProxyAPI (CPA) 安装配置信息                    ${NC}"
     echo -e "${GREEN}==============================================================${NC}"
+    echo -e "🔹 安装版本:            ${BOLD}${TAG} (${VARIANT})${NC}"
     echo -e "🔹 安装路径:            ${BOLD}${INSTALL_DIR}/cli-proxy-api${NC}"
     echo -e "🔹 配置文件:            ${BOLD}${INSTALL_DIR}/config.yaml${NC}"
     echo -e "🔹 服务监听端口:        ${BOLD}8317${NC}"
@@ -278,7 +471,8 @@ install_cpamp() {
     log_step "开始全新安装 CPA Manager Plus (CPAMP)"
     log_info "将调用官方最新的一键安装器进行标准化原生部署..."
 
-    local TMP_DIR=$(mktemp -d)
+    local TMP_DIR
+    TMP_DIR=$(mktemp -d)
     local INSTALLER_URL="https://raw.githubusercontent.com/seakee/CPA-Manager-Plus/main/bin/install-cpamp.sh"
     
     if ! curl -fsSL "${GH_PROXY}${INSTALLER_URL}" -o "$TMP_DIR/install-cpamp.sh"; then
@@ -385,7 +579,11 @@ upgrade_cpa() {
 
     # 策略 3: 从 PATH 命令直接获取
     if [ -z "$CPA_BIN" ]; then
-        CPA_BIN=$(command -v cliproxyapi || command -v CLIProxyAPI || which cli-proxy-api 2>/dev/null || true)
+        local path_cpa
+        path_cpa=$(command -v cliproxyapi || command -v CLIProxyAPI || which cli-proxy-api 2>/dev/null || true)
+        if [ -n "$path_cpa" ] && is_real_binary "$path_cpa"; then
+            CPA_BIN="$path_cpa"
+        fi
     fi
 
     # 策略 4: 常见默认路径扫描
@@ -404,7 +602,7 @@ upgrade_cpa() {
             "/opt/cliproxyapi/cli-proxy-api"
         )
         for p in "${search_paths[@]}"; do
-            if [ -f "$p" ]; then CPA_BIN="$p"; break; fi
+            if is_real_binary "$p"; then CPA_BIN="$p"; break; fi
         done
     fi
 
@@ -429,27 +627,54 @@ upgrade_cpa() {
         return 1
     fi
 
-    local CPA_DIR=$(dirname "$CPA_BIN")
-    local CTL=$(detect_service_cmd "$CPA_SVC_NAME")
+    local CPA_DIR
+    CPA_DIR=$(dirname "$CPA_BIN")
+    local CTL
+    CTL=$(detect_service_cmd "$CPA_SVC_NAME")
+    local VARIANT
+    VARIANT=$(detect_cpa_asset_variant "$CPA_DIR")
+    local LOCAL_VER
+    LOCAL_VER=$(get_local_cpa_version "$CPA_BIN" "$CPA_DIR")
 
     log_info "CPA 目标文件: $CPA_BIN"
     log_info "CPA 所在目录: $CPA_DIR"
-    log_info "服务管理器: $CTL $CPA_SVC_NAME"
+    log_info "服务管理器:   $CTL $CPA_SVC_NAME"
+    log_info "本地当前版本: ${LOCAL_VER:+v$LOCAL_VER}${LOCAL_VER:-未知} (变体: $VARIANT)"
 
-    log_info "正在获取 CPA 最新 Release 版本..."
-    local LATEST_JSON=$(curl -sL "${GH_PROXY}https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest")
-    local TAG=$(echo "$LATEST_JSON" | grep -Po '"tag_name":\s*"\K[^"]+' || true)
-    if [ -z "$TAG" ]; then
-        log_err "获取 CPA 最新版本失败！"
+    log_info "正在获取 CPA 最新可用 Release 版本与资产包..."
+    local RESOLVED
+    RESOLVED=$(resolve_release_asset "router-for-me/CLIProxyAPI" "$ARCH_REGEX" "$VARIANT" || true)
+    if [ -z "$RESOLVED" ]; then
+        log_err "获取 CPA 最新可用版本失败！"
         return 1
     fi
+
+    local TAG PKG_NAME DOWNLOAD_URL LATEST_TAG
+    TAG=$(echo "$RESOLVED" | cut -d'|' -f1)
+    PKG_NAME=$(echo "$RESOLVED" | cut -d'|' -f2)
+    DOWNLOAD_URL=$(echo "$RESOLVED" | cut -d'|' -f3)
+    LATEST_TAG=$(echo "$RESOLVED" | cut -d'|' -f4)
     local CLEAN_VER="${TAG#v}"
-    log_info "CPA 最新版本: $TAG"
 
-    local PKG_NAME="CLIProxyAPI_${CLEAN_VER}_linux_${CPA_ARCH}.tar.gz"
-    local DOWNLOAD_URL="https://github.com/router-for-me/CLIProxyAPI/releases/download/${TAG}/${PKG_NAME}"
+    if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "$TAG" ]; then
+        log_warn "上游最新 Release ($LATEST_TAG) 暂无预编译二进制包 (上游 Actions 编译失败或正在打包)，已自动回退至最新可用版本: $TAG"
+    fi
+    log_info "CPA 最新可用版本: $TAG (资产包: $PKG_NAME)"
 
-    local TMP_DIR=$(mktemp -d)
+    if [ -n "$LOCAL_VER" ] && [ "$LOCAL_VER" = "$CLEAN_VER" ]; then
+        echo "$CLEAN_VER" > "$CPA_DIR/version.txt" 2>/dev/null || true
+        echo "$VARIANT" > "$CPA_DIR/asset-variant.txt" 2>/dev/null || true
+        log_succ "当前本地 CPA 已是最新可用版本 ($TAG)，无需重复升级！"
+        local force_reinstall=""
+        read -r -p "是否仍要强制重新下载并覆盖安装 CPA $TAG？[y/N] (默认 N): " force_reinstall
+        if [[ ! "${force_reinstall:-N}" =~ ^[Yy]$ ]]; then
+            log_info "已跳过 CPA 重复下载。"
+            return 0
+        fi
+    fi
+
+    local TMP_DIR
+    TMP_DIR=$(mktemp -d)
     log_info "正在下载: $PKG_NAME ..."
     if ! curl -fSL --progress-bar "${GH_PROXY}${DOWNLOAD_URL}" -o "$TMP_DIR/$PKG_NAME"; then
         log_err "下载失败: $DOWNLOAD_URL"
@@ -459,7 +684,8 @@ upgrade_cpa() {
 
     log_info "解压新版本..."
     tar -xzf "$TMP_DIR/$PKG_NAME" -C "$TMP_DIR"
-    local NEW_BIN=$(find "$TMP_DIR" -type f \( -name "CLIProxyAPI" -o -name "cli-proxy-api" \) | head -n 1)
+    local NEW_BIN
+    NEW_BIN=$(find "$TMP_DIR" -type f \( -name "CLIProxyAPI" -o -name "cli-proxy-api" \) | head -n 1)
     if [ -z "$NEW_BIN" ]; then
         log_err "解压包中未找到二进制文件！"
         rm -rf "$TMP_DIR"
@@ -484,9 +710,11 @@ upgrade_cpa() {
         log_info "跳过备份旧二进制..."
     fi
 
-    # 替换二进制
+    # 替换二进制并同步元数据文件
     log_info "应用新版本二进制 -> $CPA_BIN"
     cp -f "$NEW_BIN" "$CPA_BIN"
+    echo "$CLEAN_VER" > "$CPA_DIR/version.txt" 2>/dev/null || true
+    echo "$VARIANT" > "$CPA_DIR/asset-variant.txt" 2>/dev/null || true
 
     # 重启并检查状态
     if [ "$CTL" != "none" ]; then
@@ -494,9 +722,12 @@ upgrade_cpa() {
         $CTL start "$CPA_SVC_NAME"
         sleep 2
         if $CTL is-active "$CPA_SVC_NAME" >/dev/null 2>&1; then
-            log_succ "✅ CPA 升级成功并已正常运行！"
-            if [ "$DO_BACKUP" = "0" ] && [ -d "$CPA_DIR/config_backup" ]; then
-                rm -rf "$CPA_DIR/config_backup"/* 2>/dev/null || true
+            log_succ "✅ CPA 升级至 $TAG 成功并已正常运行！"
+            if [ "$DO_BACKUP" = "0" ]; then
+                rm -f "${CPA_BIN}".bak.* 2>/dev/null || true
+                if [ -d "$CPA_DIR/config_backup" ]; then
+                    rm -rf "$CPA_DIR/config_backup"/* 2>/dev/null || true
+                fi
             fi
         else
             log_err "❌ CPA 服务启动异常！"
@@ -510,7 +741,7 @@ upgrade_cpa() {
     else
         nohup "$CPA_BIN" >/dev/null 2>&1 &
         sleep 2
-        log_succ "✅ CPA 二进制已更新并重新启动！"
+        log_succ "✅ CPA 二进制已更新至 $TAG 并重新启动！"
     fi
 
     rm -rf "$TMP_DIR"
@@ -544,7 +775,7 @@ upgrade_cpamp() {
         [ -d "$bdir" ] || return 1
 
         # 检查是否本身就是 runtime/package 目录
-        if [ -f "$bdir/cpa-manager-plus" ]; then
+        if is_real_binary "$bdir/cpa-manager-plus"; then
             CPAMP_BIN="$bdir/cpa-manager-plus"
             if [ -f "$bdir/../../run.sh" ]; then
                 CPAMP_BASE_DIR=$(readlink -f "$bdir/../..")
@@ -559,7 +790,6 @@ upgrade_cpamp() {
         # 检查 run.sh
         if [ -f "$bdir/run.sh" ]; then
             CPAMP_BASE_DIR="$bdir"
-            # 尝试从 run.sh 的 cd 语句提取 runtime 目录
             local target_dir
             target_dir=$(grep -E '^[[:space:]]*cd[[:space:]]+' "$bdir/run.sh" | awk '{print $2}' | tr -d '"' || true)
             if [ -n "$target_dir" ]; then
@@ -567,7 +797,7 @@ upgrade_cpamp() {
                     /*) ;;
                     *) target_dir="$bdir/$target_dir" ;;
                 esac
-                if [ -f "$target_dir/cpa-manager-plus" ]; then
+                if is_real_binary "$target_dir/cpa-manager-plus"; then
                     CPAMP_BIN="$target_dir/cpa-manager-plus"
                     return 0
                 fi
@@ -577,7 +807,7 @@ upgrade_cpamp() {
         # 检查 runtime 目录下的所有 cpa-manager-plus 二进制
         local found
         found=$(find "$bdir" -type f -name "cpa-manager-plus" 2>/dev/null | head -n 1 || true)
-        if [ -n "$found" ] && [ -f "$found" ]; then
+        if [ -n "$found" ] && is_real_binary "$found"; then
             CPAMP_BIN="$found"
             CPAMP_BASE_DIR="$bdir"
             return 0
@@ -598,10 +828,11 @@ upgrade_cpamp() {
     if [ -n "$PID_PATH" ]; then
         local EXE_LINK
         EXE_LINK=$(readlink -f "/proc/$PID_PATH/exe" 2>/dev/null || true)
-        if [ -f "$EXE_LINK" ]; then
+        if is_real_binary "$EXE_LINK"; then
             CPAMP_BIN="$EXE_LINK"
             log_info "通过运行进程精准探测到 CPAMP: $CPAMP_BIN"
-            local edir=$(dirname "$CPAMP_BIN")
+            local edir
+            edir=$(dirname "$CPAMP_BIN")
             if [ -f "$edir/../../run.sh" ]; then
                 CPAMP_BASE_DIR=$(readlink -f "$edir/../..")
             elif [ -f "$edir/run.sh" ]; then
@@ -614,10 +845,13 @@ upgrade_cpamp() {
 
     # 策略 2: 从 systemd 配置提取
     if [ -z "$CPAMP_BIN" ]; then
-        CPAMP_BIN=$(extract_execstart_from_service "$CPAMP_SVC_NAME" || true)
-        if [ -n "$CPAMP_BIN" ]; then
+        local svc_bin
+        svc_bin=$(extract_execstart_from_service "$CPAMP_SVC_NAME" || true)
+        if [ -n "$svc_bin" ] && is_real_binary "$svc_bin"; then
+            CPAMP_BIN="$svc_bin"
             log_info "通过 systemd 服务配置提取到 CPAMP: $CPAMP_BIN"
-            local sdir=$(dirname "$CPAMP_BIN")
+            local sdir
+            sdir=$(dirname "$CPAMP_BIN")
             if [ -f "$sdir/../../run.sh" ]; then
                 CPAMP_BASE_DIR=$(readlink -f "$sdir/../..")
             else
@@ -636,11 +870,11 @@ upgrade_cpamp() {
         done
     fi
 
-    # 策略 4: 从 PATH 获取
+    # 策略 4: 从 PATH 获取 (严格过滤掉 shell wrapper 脚本)
     if [ -z "$CPAMP_BIN" ]; then
         local path_cmd
         path_cmd=$(command -v cpa-manager-plus || which cpa-manager-plus 2>/dev/null || true)
-        if [ -n "$path_cmd" ] && [ -f "$path_cmd" ]; then
+        if [ -n "$path_cmd" ] && is_real_binary "$path_cmd"; then
             CPAMP_BIN="$path_cmd"
             CPAMP_BASE_DIR=$(dirname "$path_cmd")
         fi
@@ -653,7 +887,7 @@ upgrade_cpamp() {
         INPUT_PATH="${INPUT_PATH%/}"
         if [ -d "$INPUT_PATH" ]; then
             resolve_from_base_dir "$INPUT_PATH" || true
-        elif [ -f "$INPUT_PATH" ]; then
+        elif is_real_binary "$INPUT_PATH"; then
             CPAMP_BIN="$INPUT_PATH"
             CPAMP_BASE_DIR=$(dirname "$INPUT_PATH")
         fi
@@ -670,7 +904,8 @@ upgrade_cpamp() {
         CPAMP_BIN=$(find "$CPAMP_BASE_DIR" -type f -name "cpa-manager-plus" 2>/dev/null | head -n 1 || true)
     fi
 
-    local CTL=$(detect_service_cmd "$CPAMP_SVC_NAME")
+    local CTL
+    CTL=$(detect_service_cmd "$CPAMP_SVC_NAME")
     local USE_RUN_SH=0
     if [ "$CTL" = "none" ]; then
         if [ -n "$CPAMP_BASE_DIR" ] && [ -f "$CPAMP_BASE_DIR/run.sh" ]; then
@@ -683,23 +918,46 @@ upgrade_cpamp() {
         log_info "检测到 systemd 服务管理方式: $CTL $CPAMP_SVC_NAME"
     fi
 
+    local LOCAL_CPAMP_VER
+    LOCAL_CPAMP_VER=$(get_local_cpamp_version "$CPAMP_BIN")
+
     log_info "CPAMP 项目根目录: ${CPAMP_BASE_DIR:-未知}"
     log_info "CPAMP 二进制文件: ${CPAMP_BIN:-待升级写入}"
+    log_info "CPAMP 本地版本:   ${LOCAL_CPAMP_VER:+v$LOCAL_CPAMP_VER}${LOCAL_CPAMP_VER:-未知}"
 
-    # 获取最新版本 tag
-    log_info "正在获取 CPAMP 最新 Release 版本..."
-    local LATEST_JSON=$(curl -sL "${GH_PROXY}https://api.github.com/repos/seakee/CPA-Manager-Plus/releases/latest")
-    local TAG=$(echo "$LATEST_JSON" | grep -Po '"tag_name":\s*"\K[^"]+' || true)
-    if [ -z "$TAG" ]; then
+    # 获取最新拥有可用资产包的 Release
+    log_info "正在获取 CPAMP 最新可用 Release 版本与资产包..."
+    local RESOLVED
+    RESOLVED=$(resolve_release_asset "seakee/CPA-Manager-Plus" "$ARCH_REGEX" "default" || true)
+    if [ -z "$RESOLVED" ]; then
         log_err "获取 CPAMP 最新版本失败！"
         return 1
     fi
-    log_info "CPAMP 最新版本: $TAG"
 
-    local PKG_NAME="cpa-manager-plus_${TAG}_linux_${CPAMP_ARCH}.tar.gz"
-    local DOWNLOAD_URL="https://github.com/seakee/CPA-Manager-Plus/releases/download/${TAG}/${PKG_NAME}"
+    local TAG PKG_NAME DOWNLOAD_URL LATEST_TAG
+    TAG=$(echo "$RESOLVED" | cut -d'|' -f1)
+    PKG_NAME=$(echo "$RESOLVED" | cut -d'|' -f2)
+    DOWNLOAD_URL=$(echo "$RESOLVED" | cut -d'|' -f3)
+    LATEST_TAG=$(echo "$RESOLVED" | cut -d'|' -f4)
+    local CLEAN_VER="${TAG#v}"
 
-    local TMP_DIR=$(mktemp -d)
+    if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "$TAG" ]; then
+        log_warn "CPAMP 最新 Release ($LATEST_TAG) 暂无预编译包，已自动回退至最新可用版本: $TAG"
+    fi
+    log_info "CPAMP 最新可用版本: $TAG (资产包: $PKG_NAME)"
+
+    if [ -n "$LOCAL_CPAMP_VER" ] && [ "$LOCAL_CPAMP_VER" = "$CLEAN_VER" ]; then
+        log_succ "当前本地 CPAMP 已是最新可用版本 ($TAG)，无需重复升级！"
+        local force_reinstall=""
+        read -r -p "是否仍要强制重新下载并覆盖安装 CPAMP $TAG？[y/N] (默认 N): " force_reinstall
+        if [[ ! "${force_reinstall:-N}" =~ ^[Yy]$ ]]; then
+            log_info "已跳过 CPAMP 重复下载。"
+            return 0
+        fi
+    fi
+
+    local TMP_DIR
+    TMP_DIR=$(mktemp -d)
     log_info "正在下载: $PKG_NAME ..."
     if ! curl -fSL --progress-bar "${GH_PROXY}${DOWNLOAD_URL}" -o "$TMP_DIR/$PKG_NAME"; then
         log_err "下载失败: $DOWNLOAD_URL"
@@ -709,7 +967,8 @@ upgrade_cpamp() {
 
     log_info "解压新版本..."
     tar -xzf "$TMP_DIR/$PKG_NAME" -C "$TMP_DIR"
-    local NEW_BIN=$(find "$TMP_DIR" -type f -name "cpa-manager-plus" | head -n 1)
+    local NEW_BIN
+    NEW_BIN=$(find "$TMP_DIR" -type f -name "cpa-manager-plus" | head -n 1)
     if [ -z "$NEW_BIN" ]; then
         log_err "解压包中未找到 cpa-manager-plus 二进制！"
         rm -rf "$TMP_DIR"
@@ -722,7 +981,8 @@ upgrade_cpamp() {
         log_info "停止服务: $CTL stop $CPAMP_SVC_NAME"
         $CTL stop "$CPAMP_SVC_NAME" || true
     elif [ "$USE_RUN_SH" -eq 1 ] && [ -n "$CPAMP_BASE_DIR" ] && [ -f "$CPAMP_BASE_DIR/cpa-manager-plus.pid" ]; then
-        local OLD_PID=$(cat "$CPAMP_BASE_DIR/cpa-manager-plus.pid" 2>/dev/null || true)
+        local OLD_PID
+        OLD_PID=$(cat "$CPAMP_BASE_DIR/cpa-manager-plus.pid" 2>/dev/null || true)
         if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" >/dev/null 2>&1; then
             log_info "停止原有 CPAMP 进程 (PID: $OLD_PID)..."
             kill "$OLD_PID" || true
@@ -751,12 +1011,17 @@ upgrade_cpamp() {
 
     # 替换或安装文件
     log_info "应用新版本文件..."
-    local EXTRACTED_TOP=$(dirname "$NEW_BIN")
+    local EXTRACTED_TOP
+    EXTRACTED_TOP=$(dirname "$NEW_BIN")
     local TARGET_DIR=""
 
     if [ -n "$CPAMP_BIN" ] && [ -f "$CPAMP_BIN" ]; then
         TARGET_DIR=$(dirname "$CPAMP_BIN")
         cp -f "$NEW_BIN" "$CPAMP_BIN"
+        if [ -f "$EXTRACTED_TOP/cpa-manager-plusctl" ]; then
+            cp -f "$EXTRACTED_TOP/cpa-manager-plusctl" "$TARGET_DIR/cpa-manager-plusctl" 2>/dev/null || true
+            chmod +x "$TARGET_DIR/cpa-manager-plusctl" 2>/dev/null || true
+        fi
     elif [ -n "$CPAMP_BASE_DIR" ]; then
         local RUNTIME_PKG="cpa-manager-plus_${TAG}_linux_${CPAMP_ARCH}"
         TARGET_DIR="$CPAMP_BASE_DIR/runtime/$RUNTIME_PKG"
@@ -767,7 +1032,7 @@ upgrade_cpamp() {
 
         # 如果有 run.sh，更新其中的 cd 目标目录为最新 runtime
         if [ -f "$CPAMP_BASE_DIR/run.sh" ]; then
-            sed -i -E "s|cd ".*runtime/cpa-manager-plus_.*"|cd "$TARGET_DIR"|g" "$CPAMP_BASE_DIR/run.sh" || true
+            sed -i -E "s|cd \".*runtime/cpa-manager-plus_.*\"|cd \"$TARGET_DIR\"|g" "$CPAMP_BASE_DIR/run.sh" || true
             sed -i -E "s|# CPAMP_RUNTIME_PACKAGE=.*|# CPAMP_RUNTIME_PACKAGE=$RUNTIME_PKG|g" "$CPAMP_BASE_DIR/run.sh" || true
         fi
     fi
@@ -790,20 +1055,19 @@ upgrade_cpamp() {
     sleep 3
 
     # 健康检查
-    local HEALTH=$(curl -s -m 3 http://127.0.0.1:18317/health 2>/dev/null || true)
+    local HEALTH
+    HEALTH=$(curl -s -m 3 http://127.0.0.1:18317/health 2>/dev/null || true)
     if [ -n "$HEALTH" ] || pgrep -f "cpa-manager-plus" >/dev/null 2>&1; then
         log_info "健康检查响应: ${HEALTH:-已正常运行}"
-        log_succ "✅ CPAMP 升级成功并已正常运行！"
+        log_succ "✅ CPAMP 升级至 $TAG 成功并已正常运行！"
 
         # 小硬盘极简模式：自动深度瘦身，清理 runtime 中的旧版本目录与 downloads 缓存
         if [ "$DO_BACKUP" = "0" ] && [ -n "$CPAMP_BASE_DIR" ]; then
             log_info "正在执行小硬盘专属瘦身清理..."
-            # 清理 downloads/ 下的安装包
             if [ -d "$CPAMP_BASE_DIR/downloads" ]; then
                 rm -rf "$CPAMP_BASE_DIR/downloads"/* 2>/dev/null || true
                 log_info "已清理安装包缓存: $CPAMP_BASE_DIR/downloads"
             fi
-            # 清理 runtime/ 下除当前运行版本之外的旧历史版本目录
             if [ -d "$CPAMP_BASE_DIR/runtime" ] && [ -n "$TARGET_DIR" ]; then
                 local cleaned_count=0
                 for old_ver in "$CPAMP_BASE_DIR"/runtime/*; do
@@ -926,7 +1190,7 @@ main() {
     echo -e "${GREEN}==============================================================${NC}"
     echo -e "${GREEN}      CLIProxyAPI & CPA Manager Plus 综合管理工具箱            ${NC}"
     echo -e "${GREEN}==============================================================${NC}"
-    echo "1. 智能版本升级 (支持 CPA/CPAMP、全自动探测、备份/小硬盘无备份模式)"
+    echo "1. 智能版本升级 (支持 CPA/CPAMP、动态包名匹配、空 Release 自动回退、备份/无备份模式)"
     echo "2. 全新一键安装 (支持 CPA 原生/守护、CPAMP 标准化安装、密钥大字报输出)"
     echo "3. 退出"
     read -r -p "请选择操作 [1-3] (默认 1): " main_choice
