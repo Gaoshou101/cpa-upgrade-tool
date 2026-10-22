@@ -639,7 +639,9 @@ upgrade_cpa() {
     log_info "CPA 目标文件: $CPA_BIN"
     log_info "CPA 所在目录: $CPA_DIR"
     log_info "服务管理器:   $CTL $CPA_SVC_NAME"
-    log_info "本地当前版本: ${LOCAL_VER:+v$LOCAL_VER}${LOCAL_VER:-未知} (变体: $VARIANT)"
+    local DISP_CPA_VER="未知"
+    [ -n "$LOCAL_VER" ] && DISP_CPA_VER="v$LOCAL_VER"
+    log_info "本地当前版本: $DISP_CPA_VER (变体: $VARIANT)"
 
     log_info "正在获取 CPA 最新可用 Release 版本与资产包..."
     local RESOLVED
@@ -668,6 +670,9 @@ upgrade_cpa() {
         local force_reinstall=""
         read -r -p "是否仍要强制重新下载并覆盖安装 CPA $TAG？[y/N] (默认 N): " force_reinstall
         if [[ ! "${force_reinstall:-N}" =~ ^[Yy]$ ]]; then
+            if [ "$DO_BACKUP" = "0" ]; then
+                rm -f "${CPA_BIN}".bak.* 2>/dev/null || true
+            fi
             log_info "已跳过 CPA 重复下载。"
             return 0
         fi
@@ -923,7 +928,9 @@ upgrade_cpamp() {
 
     log_info "CPAMP 项目根目录: ${CPAMP_BASE_DIR:-未知}"
     log_info "CPAMP 二进制文件: ${CPAMP_BIN:-待升级写入}"
-    log_info "CPAMP 本地版本:   ${LOCAL_CPAMP_VER:+v$LOCAL_CPAMP_VER}${LOCAL_CPAMP_VER:-未知}"
+    local DISP_CPAMP_VER="未知"
+    [ -n "$LOCAL_CPAMP_VER" ] && DISP_CPAMP_VER="v$LOCAL_CPAMP_VER"
+    log_info "CPAMP 本地版本:   $DISP_CPAMP_VER"
 
     # 获取最新拥有可用资产包的 Release
     log_info "正在获取 CPAMP 最新可用 Release 版本与资产包..."
